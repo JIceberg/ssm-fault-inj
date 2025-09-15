@@ -1,0 +1,23 @@
+2025-09-15 00:22:01,343 INFO    MainThread:138231 [wandb_setup.py:_flush():81] Current SDK version is 0.21.4
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_setup.py:_flush():81] Configure stats pid to 138231
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_setup.py:_flush():81] Loading settings from /home/jaxon/.config/wandb/settings
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_setup.py:_flush():81] Loading settings from /home/jaxon/research/fault-injection/ssm-fault-inj/wandb/settings
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_init.py:setup_run_log_directory():686] Logging user logs to /home/jaxon/research/fault-injection/ssm-fault-inj/wandb/run-20250915_002201-9pfib3yb/logs/debug.log
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_init.py:setup_run_log_directory():687] Logging internal logs to /home/jaxon/research/fault-injection/ssm-fault-inj/wandb/run-20250915_002201-9pfib3yb/logs/debug-internal.log
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_init.py:init():813] calling init triggers
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_init.py:init():818] wandb.init called with sweep_config: {}
+config: {'dataset': 'mnist-classification', 'layer': 's4', 'seed': 0, 'model': {'d_model': 128, 'n_layers': 4, 'dropout': 0.0, 'prenorm': True, 'embedding': False, 'layer': {'N': 64}}, 'train': {'epochs': 10, 'bsz': 128, 'lr': 0.001, 'lr_schedule': False, 'weight_decay': 0.01, 'checkpoint': False, 'suffix': None, 'sample': None}, '_wandb': {}}
+2025-09-15 00:22:01,344 INFO    MainThread:138231 [wandb_init.py:init():854] starting backend
+2025-09-15 00:22:01,576 INFO    MainThread:138231 [wandb_init.py:init():857] sending inform_init request
+2025-09-15 00:22:01,580 INFO    MainThread:138231 [wandb_init.py:init():865] backend started and connected
+2025-09-15 00:22:01,588 INFO    MainThread:138231 [wandb_init.py:init():936] updated telemetry
+2025-09-15 00:22:01,591 INFO    MainThread:138231 [wandb_init.py:init():960] communicating run to backend with 90.0 second timeout
+2025-09-15 00:22:02,007 INFO    MainThread:138231 [wandb_init.py:init():1011] starting run threads in backend
+2025-09-15 00:22:02,108 INFO    MainThread:138231 [wandb_run.py:_console_start():2506] atexit reg
+2025-09-15 00:22:02,108 INFO    MainThread:138231 [wandb_run.py:_redirect():2354] redirect: wrap_raw
+2025-09-15 00:22:02,109 INFO    MainThread:138231 [wandb_run.py:_redirect():2423] Wrapping output streams.
+2025-09-15 00:22:02,109 INFO    MainThread:138231 [wandb_run.py:_redirect():2446] Redirects installed.
+2025-09-15 00:22:02,111 INFO    MainThread:138231 [wandb_init.py:init():1049] run started, returning control to user process
+2025-09-15 00:58:11,475 INFO    wandb-AsyncioManager-main:138231 [service_client.py:_forward_responses():84] Reached EOF.
+2025-09-15 00:58:11,475 INFO    wandb-AsyncioManager-main:138231 [mailbox.py:close():137] Closing mailbox, abandoning 1 handles.

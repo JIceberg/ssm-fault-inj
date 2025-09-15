@@ -1,0 +1,27 @@
+[*] Warning: models are not being checkpoint
+[*] Setting Randomness...
+[2025-09-15 13:40:51,920][jax._src.xla_bridge][INFO] - Unable to initialize backend 'cuda':
+[2025-09-15 13:40:51,920][jax._src.xla_bridge][INFO] - Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+[2025-09-15 13:40:51,924][jax._src.xla_bridge][INFO] - Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+[2025-09-15 13:40:51,925][jax._src.xla_bridge][WARNING] - An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+[*] Generating MNIST Classification Dataset...
+[*] Starting `s4` Training on `mnist-classification` =>> Initializing...
+Error executing job with overrides: []
+jax.errors.SimplifiedTraceback: For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/jaxon/research/fault-injection/ssm-fault-inj/s4/train.py", line 480, in main
+    example_train(**cfg)
+  File "/home/jaxon/research/fault-injection/ssm-fault-inj/s4/train.py", line 357, in example_train
+    state = create_train_state(
+  File "/home/jaxon/research/fault-injection/ssm-fault-inj/s4/train.py", line 75, in create_train_state
+    params = model.init(
+  File "/home/jaxon/research/fault-injection/ssm-fault-inj/s4/s4.py", line 713, in __call__
+    x = layer(x)
+  File "/home/jaxon/research/fault-injection/ssm-fault-inj/s4/s4.py", line 632, in setup
+    self.corr = CorrectionModuleDense(k=4, atol=1e-4)
+TypeError: __init__() got an unexpected keyword argument 'atol'
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

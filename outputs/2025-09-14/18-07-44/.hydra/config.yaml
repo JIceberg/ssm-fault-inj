@@ -1,0 +1,24 @@
+dataset: mnist-classification
+layer: s4
+seed: 0
+model:
+  d_model: 128
+  n_layers: 4
+  dropout: 0.0
+  prenorm: true
+  embedding: false
+  layer:
+    'N': 64
+train:
+  epochs: 10
+  bsz: 128
+  lr: 0.001
+  lr_schedule: false
+  weight_decay: 0.01
+  checkpoint: true
+  suffix: null
+  sample: null
+wandb:
+  mode: online
+  project: s4
+  entity: null

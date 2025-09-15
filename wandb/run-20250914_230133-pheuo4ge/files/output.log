@@ -1,0 +1,81 @@
+[*] Setting Randomness...
+[2025-09-14 23:01:34,640][jax._src.xla_bridge][INFO] - Unable to initialize backend 'cuda':
+[2025-09-14 23:01:34,641][jax._src.xla_bridge][INFO] - Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+[2025-09-14 23:01:34,648][jax._src.xla_bridge][INFO] - Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+[2025-09-14 23:01:34,649][jax._src.xla_bridge][WARNING] - An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+[*] Generating MNIST Classification Dataset...
+[*] Starting `s4` Training on `mnist-classification` =>> Initializing...
+/home/jaxon/research/fault-injection/ssm-fault-inj/s4/train.py:131: DeprecationWarning: jax.tree_leaves is deprecated: use jax.tree.leaves (jax v0.4.25 or newer) or jax.tree_util.tree_leaves (any JAX version).
+  extra_keys = set(lr_layer.keys()) - set(jax.tree_leaves(name_map(params)))
+/home/jaxon/research/fault-injection/ssm-fault-inj/s4/train.py:143: DeprecationWarning: jax.tree_leaves is deprecated: use jax.tree.leaves (jax v0.4.25 or newer) or jax.tree_util.tree_leaves (any JAX version).
+  print(f"[*] Trainable Parameters: {sum(jax.tree_leaves(param_sizes))}")
+[*] Trainable Parameters: 397834
+[*] Total training steps: 4690
+[*] Starting Training Epoch 1...
+100%|██████████████████████████████████████████████████████████████████████████████████████████████| 469/469 [35:47<00:00,  4.58s/it]
+[*] Running Epoch 1 Validation...
+100%|████████████████████████████████████████████████████████████████████████████████████████████████| 79/79 [01:28<00:00,  1.12s/it]
+
+=>> Epoch 1 Metrics ===
+	Train Loss: 0.83870 -- Train Accuracy: 0.7196
+	 Test Loss: 0.17088 --  Test Accuracy: 0.9498
+[2025-09-14 23:38:59,187][absl][INFO] - Saving checkpoint at step: 0
+[2025-09-14 23:38:59,188][absl][INFO] - Using Orbax as backend to save Flax checkpoints. For potential troubleshooting see: https://flax.readthedocs.io/en/latest/guides/training_techniques/use_checkpointing.html#orbax-as-backend-troubleshooting
+[2025-09-14 23:38:59,189][absl][INFO] - orbax-checkpoint version: 0.6.4
+[2025-09-14 23:38:59,190][absl][WARNING] - The `aggregate` option is deprecated and will be ignored.
+[2025-09-14 23:38:59,192][absl][INFO] - [thread=MainThread] Failed to get flag value for EXPERIMENTAL_ORBAX_USE_DISTRIBUTED_PROCESS_ID.
+[2025-09-14 23:38:59,192][absl][INFO] - [process=0] Started saving checkpoint to checkpoints/mnist-classification/s4-d_model=128-lr=0.001-bsz=128/checkpoint_0.
+[2025-09-14 23:38:59,193][absl][INFO] - [process=0][thread=MainThread] Skipping global process sync, barrier name: create_tmp_directory:pre.checkpoint_0.1
+[2025-09-14 23:38:59,195][absl][INFO] - Creating tmp directory checkpoints/mnist-classification/s4-d_model=128-lr=0.001-bsz=128/checkpoint_0.orbax-checkpoint-tmp-0
+[2025-09-14 23:38:59,201][absl][INFO] - Wrote CheckpointMetadata=CheckpointMetadata(init_timestamp_nsecs=1757907539201151628, commit_timestamp_nsecs=None), json={"init_timestamp_nsecs": 1757907539201151628, "commit_timestamp_nsecs": null} to checkpoints/mnist-classification/s4-d_model=128-lr=0.001-bsz=128/checkpoint_0.orbax-checkpoint-tmp-0
+[2025-09-14 23:38:59,202][absl][INFO] - [process=0][thread=MainThread] Skipping global process sync, barrier name: create_tmp_directory:post.checkpoint_0.2
+[2025-09-14 23:38:59,241][absl][INFO] - [process=0] /jax/checkpoint/write/blocking_bytes_per_sec: 121.6 MiB/s (total bytes: 4.6 MiB) (time elapsed: 37 milliseconds) (per-host)
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/home/jaxon/research/fault-injection/ssm-fault-inj/s4/train.py", line 465, in main
+    example_train(**cfg)
+  File "/home/jaxon/research/fault-injection/ssm-fault-inj/s4/train.py", line 381, in example_train
+    ckpt_path = checkpoints.save_checkpoint(
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/flax/training/checkpoints.py", line 697, in save_checkpoint
+    orbax_checkpointer.save(
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/checkpointer.py", line 204, in save
+    self._handler.save(tmpdir.get(), args=ckpt_args)
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/_src/handlers/pytree_checkpoint_handler.py", line 566, in save
+    self._handler_impl.save(directory, args=args)
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/_src/handlers/base_pytree_checkpoint_handler.py", line 501, in save
+    asyncio.run(async_save(directory, *args, **kwargs))
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/asyncio/base_events.py", line 647, in run_until_complete
+    return future.result()
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/_src/handlers/base_pytree_checkpoint_handler.py", line 499, in async_save
+    f.result()  # Block on result.
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/future.py", line 78, in result
+    f.result(timeout=time_remaining)
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/type_handlers.py", line 472, in result
+    return self._t.join(timeout=timeout)
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/future.py", line 62, in join
+    raise self._exception
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/future.py", line 55, in run
+    super().run()
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/threading.py", line 917, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/type_handlers.py", line 467, in <lambda>
+    target=lambda: asyncio.run(coro),
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/asyncio/base_events.py", line 647, in run_until_complete
+    return future.result()
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/type_handlers.py", line 1220, in _background_serialize
+    tspec = self._get_json_tspec_write(
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/type_handlers.py", line 1090, in _get_json_tspec_write
+    return get_json_tspec_write(
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/type_handlers.py", line 315, in get_json_tspec_write
+    tspec = _get_json_tspec(
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/type_handlers.py", line 268, in _get_json_tspec
+    kvstore_tspec = ts_utils.build_kvstore_tspec(
+  File "/home/jaxon/miniconda3/envs/ssm-faults/lib/python3.9/site-packages/orbax/checkpoint/_src/serialization/tensorstore_utils.py", line 92, in build_kvstore_tspec
+    raise ValueError(f'Checkpoint path should be absolute. Got {directory}')
+ValueError: Checkpoint path should be absolute. Got checkpoints/mnist-classification/s4-d_model=128-lr=0.001-bsz=128/checkpoint_0.orbax-checkpoint-tmp-0
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
