@@ -1,4 +1,0 @@
-[2025-09-14 17:13:41,822][jax._src.xla_bridge][INFO] - Unable to initialize backend 'cuda': 
-[2025-09-14 17:13:41,823][jax._src.xla_bridge][INFO] - Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
-[2025-09-14 17:13:41,825][jax._src.xla_bridge][INFO] - Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
-[2025-09-14 17:13:41,825][jax._src.xla_bridge][WARNING] - An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.

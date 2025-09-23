@@ -72,13 +72,13 @@ def create_train_state(
 ):
     model = model_cls(training=True)
     init_rng, dropout_rng = jax.random.split(rng, num=2)
-    params = model.init(
+    variables = model.init(
         {"params": init_rng, "dropout": dropout_rng},
         np.array(next(iter(trainloader))[0].numpy()),
     )
     # Note: Added immediate `unfreeze()` to play well w/ Optax. See below!
-    # print(params["params"])
-    params = params["params"] # .unfreeze()
+    # print("param keys:", params.keys())
+    params = variables["params"] # .unfreeze()
 
     # Handle learning rates:
     # - LR scheduler
@@ -145,7 +145,7 @@ def create_train_state(
 
     return train_state.TrainState.create(
         apply_fn=model.apply, params=params, tx=tx
-    )
+    ), variables
 
 
 # We also use this opportunity to write generic train_epoch and validation functions. These functions generally
@@ -153,9 +153,10 @@ def create_train_state(
 # We define the step functions on a model-specific basis below.
 
 
-def train_epoch(state, rng, model, trainloader, classification=False):
+def train_epoch(state, rng, model, trainloader, variables, classification=False):
     # Store Metrics
     model = model(training=True)
+    # model.inject_fault = True
     batch_losses, batch_accuracies = [], []
     for batch_idx, (inputs, labels) in enumerate(tqdm(trainloader)):
         inputs = np.array(inputs.numpy())
@@ -166,6 +167,7 @@ def train_epoch(state, rng, model, trainloader, classification=False):
             drop_rng,
             inputs,
             labels,
+            variables,
             model,
             classification=classification,
         )
@@ -180,24 +182,29 @@ def train_epoch(state, rng, model, trainloader, classification=False):
     )
 
 
-def validate(params, model, testloader, classification=False):
+def validate(variables, model, testloader, classification=False):
     # Compute average loss & accuracy
     model = model(training=False)
+    model.inject_fault = False
+    model.compute_grad = True
     losses, accuracies = [], []
     for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
         inputs = np.array(inputs.numpy())
         labels = np.array(labels.numpy())  # Not the most efficient...
         loss, acc = eval_step(
-            inputs, labels, params, model, classification=classification,
-            inject_fault=False, compute_grad=True,
+            inputs, labels, variables, 
+            model=model,
+            classification=classification,
         )
-
+    model.inject_fault = True
+    model.compute_grad = False
     for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
         inputs = np.array(inputs.numpy())
         labels = np.array(labels.numpy())  # Not the most efficient...
         loss, acc = eval_step(
-            inputs, labels, params, model, classification=classification,
-            inject_fault=True, compute_grad=False,
+            inputs, labels, variables, 
+            model=model,
+            classification=classification,
         )
         losses.append(loss)
         accuracies.append(acc)
@@ -230,14 +237,15 @@ class FeedForwardModel(nn.Module):
 # calls will become increasingly important as we optimize S4.
 
 
-@partial(jax.jit, static_argnums=(4, 5))
+@partial(jax.jit, static_argnums=(5, 6))
 def train_step(
-    state, rng, batch_inputs, batch_labels, model, classification=False,
+    state, rng, batch_inputs, batch_labels, variables, model, classification=False,
     
-):
-    def loss_fn(params):
+): 
+    # model = model.clone(inject_fault=True)
+    def loss_fn(params, variables):
         logits, mod_vars = model.apply(
-            {"params": params},
+            variables,
             batch_inputs,
             rngs={"dropout": rng},
             mutable=["intermediates"],
@@ -250,20 +258,18 @@ def train_step(
         batch_labels = batch_inputs[:, :, 0]
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (logits, acc)), grads = grad_fn(state.params)
+    (loss, (logits, acc)), grads = grad_fn(state.params, variables)
     state = state.apply_gradients(grads=grads)
     return state, loss, acc
 
 
 @partial(jax.jit, static_argnums=(3, 4))
-def eval_step(batch_inputs, batch_labels, params, model, classification=False, inject_fault=False, compute_grad=False):
+def eval_step(batch_inputs, batch_labels, variables, model, classification=False):
     if not classification:
         batch_labels = batch_inputs[:, :, 0]
     logits = model.apply(
-        {"params": params},
-        batch_inputs,
-        inject_fault=inject_fault,
-        compute_grad=compute_grad,
+        variables,
+        batch_inputs
     )
     loss = np.mean(cross_entropy_loss(logits, batch_labels))
     acc = np.mean(compute_accuracy(logits, batch_labels))
@@ -354,7 +360,7 @@ def example_train(
         **model,
     )
 
-    state = create_train_state(
+    state, variables = create_train_state(
         rng,
         model_cls,
         trainloader,
@@ -374,12 +380,13 @@ def example_train(
             train_rng,
             model_cls,
             trainloader,
+            variables,
             classification=classification,
         )
 
         print(f"[*] Running Epoch {epoch + 1} Validation...")
         test_loss, test_acc = validate(
-            state.params, model_cls, testloader, classification=classification
+            variables, model_cls, testloader, classification=classification
         )
 
         print(f"\n=>> Epoch {epoch + 1} Metrics ===")
