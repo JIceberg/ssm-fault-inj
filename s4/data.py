@@ -388,7 +388,7 @@ def create_mnist_classification_dataset(bsz=128):
         train, batch_size=bsz, shuffle=True
     )
     testloader = torch.utils.data.DataLoader(
-        test, batch_size=bsz, shuffle=False
+        test, batch_size=bsz, shuffle=False, drop_last=True
     )
 
     return trainloader, testloader, N_CLASSES, SEQ_LENGTH, IN_DIM

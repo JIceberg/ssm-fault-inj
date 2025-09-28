@@ -12,7 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 from data import Datasets
 from dss import DSSLayer
-from s4 import BatchStackedModel, S4Layer, SSMLayer, sample_image_prefix
+from s4 import BatchStackedModel, S4Layer, SSMLayer, sample_image_prefix, init_recurrence
 from s4d import S4DLayer
 
 
@@ -74,8 +74,9 @@ def create_train_state(
     init_rng, dropout_rng = jax.random.split(rng, num=2)
     variables = model.init(
         {"params": init_rng, "dropout": dropout_rng},
-        np.array(next(iter(trainloader))[0].numpy()),
+        np.array(next(iter(trainloader))[0].numpy())
     )
+    print("variable keys:",variables.keys())
     # Note: Added immediate `unfreeze()` to play well w/ Optax. See below!
     # print("param keys:", params.keys())
     params = variables["params"] # .unfreeze()
@@ -155,19 +156,20 @@ def create_train_state(
 
 def train_epoch(state, rng, model, trainloader, variables, classification=False):
     # Store Metrics
-    model = model(training=True)
+    model = model(training=True, decode=False)
     # model.inject_fault = True
     batch_losses, batch_accuracies = [], []
     for batch_idx, (inputs, labels) in enumerate(tqdm(trainloader)):
         inputs = np.array(inputs.numpy())
         labels = np.array(labels.numpy())  # Not the most efficient...
+        # print(inputs.shape, labels.shape)
         rng, drop_rng = jax.random.split(rng)
         state, loss, acc = train_step(
             state,
             drop_rng,
             inputs,
-            labels,
             variables,
+            labels,
             model,
             classification=classification,
         )
@@ -184,20 +186,20 @@ def train_epoch(state, rng, model, trainloader, variables, classification=False)
 
 def validate(variables, model, testloader, classification=False):
     # Compute average loss & accuracy
-    model = model(training=False)
-    model.inject_fault = False
-    model.compute_grad = True
+    model = model(training=False, decode=True)
+    # model.inject_fault = False
+    # model.compute_grad = True
     losses, accuracies = [], []
-    for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
-        inputs = np.array(inputs.numpy())
-        labels = np.array(labels.numpy())  # Not the most efficient...
-        loss, acc = eval_step(
-            inputs, labels, variables, 
-            model=model,
-            classification=classification,
-        )
+    # for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
+    #     inputs = np.array(inputs.numpy())
+    #     labels = np.array(labels.numpy())  # Not the most efficient...
+    #     loss, acc = eval_step(
+    #         inputs, labels, variables, 
+    #         model=model,
+    #         classification=classification,
+    #     )
     model.inject_fault = True
-    model.compute_grad = False
+    # model.compute_grad = False
     for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
         inputs = np.array(inputs.numpy())
         labels = np.array(labels.numpy())  # Not the most efficient...
@@ -239,16 +241,16 @@ class FeedForwardModel(nn.Module):
 
 @partial(jax.jit, static_argnums=(5, 6))
 def train_step(
-    state, rng, batch_inputs, batch_labels, variables, model, classification=False,
+    state, rng, batch_inputs, variables, batch_labels, model, classification=False,
     
 ): 
     # model = model.clone(inject_fault=True)
     def loss_fn(params, variables):
         logits, mod_vars = model.apply(
-            variables,
+            {"params": params},
             batch_inputs,
             rngs={"dropout": rng},
-            mutable=["intermediates"],
+            mutable=["intermediates", "prime"],
         )
         loss = np.mean(cross_entropy_loss(logits, batch_labels))
         acc = np.mean(compute_accuracy(logits, batch_labels))
@@ -269,7 +271,7 @@ def eval_step(batch_inputs, batch_labels, variables, model, classification=False
         batch_labels = batch_inputs[:, :, 0]
     logits = model.apply(
         variables,
-        batch_inputs
+        batch_inputs,
     )
     loss = np.mean(cross_entropy_loss(logits, batch_labels))
     acc = np.mean(compute_accuracy(logits, batch_labels))
@@ -385,8 +387,13 @@ def example_train(
         )
 
         print(f"[*] Running Epoch {epoch + 1} Validation...")
+        start = np.array(next(iter(testloader))[0].numpy())
+        start = np.zeros_like(start)
+        # params, prime, cache = init_recurrence(model, params, start[:, :-1], rng)
+        params, prime, cache = init_recurrence(model_cls(training=False, decode=True), state.params, start, rng)
+        val_variables = {"params": params, "prime": prime, "cache": cache}
         test_loss, test_acc = validate(
-            variables, model_cls, testloader, classification=classification
+            val_variables, model_cls, testloader, classification=classification
         )
 
         print(f"\n=>> Epoch {epoch + 1} Metrics ===")

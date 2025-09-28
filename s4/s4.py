@@ -13,113 +13,6 @@ if __name__ == "__main__":
     # But we don't want it when importing as a library
     rng = jax.random.PRNGKey(1)
 
-def random_bitflip(output, error_rate=1e-5, key=None):
-    flat_output = output.reshape(-1)
-
-    # bitcast float32 -> uint32
-    float_bits = jax.lax.bitcast_convert_type(flat_output, jnp.uint32)
-
-    num_elements = flat_output.size
-    if key is None:
-        key = jax.random.PRNGKey(0)
-
-    key1, key2, key3 = jax.random.split(key, 3)
-
-    # pick random bit positions [0, 31]
-    random_bits = jax.random.randint(key1, (num_elements,), 0, 32, dtype=jnp.uint32)
-
-    # decide which elements to flip
-    flip_mask = jax.random.bernoulli(key2, p=error_rate, shape=(num_elements,))
-
-    # flip the selected bits
-    flipped_bits = float_bits ^ (1 << random_bits)
-
-    # convert back to float
-    flipped_vals = jax.lax.bitcast_convert_type(flipped_bits, jnp.float32)
-
-    # guard against NaN/Inf: revert to original if not finite
-    valid_mask = jnp.isfinite(flipped_vals)
-    safe_vals = jnp.where(valid_mask, flipped_vals, flat_output)
-
-    # apply flip_mask
-    final_vals = jnp.where(flip_mask, safe_vals, flat_output)
-
-    return final_vals.reshape(output.shape)
-
-def nan_checker(x):
-    return jnp.where(jnp.isfinite(x), x, 0.0)
-
-class CorrectionModuleDense:
-    def __init__(self, k=4):
-        self.mean_grad = {}
-        self.var_grad = {}
-        self.num_updates = {}
-        self.k = k
-
-        # fixed kernel [-1, 1, 0] (1D conv with padding)
-        self.kernel = jnp.array([-1.0, 1.0, 0.0], dtype=jnp.float32).reshape(1, 1, -1)
-
-    def get_gradient(self, x):
-        """
-        x: shape [batch, length]
-        returns: gradient estimate with same shape
-        """
-        x = x[:, None, :]  # [batch, in_ch=1, length]
-        grad = jax.lax.conv_general_dilated(
-            lhs=x,
-            rhs=self.kernel,
-            window_strides=(1,),
-            padding=[(1, 1)],   # 'same' with kernel_size=3
-            dimension_numbers=("NCH", "OIH", "NCH"),
-        )
-        return grad[:, 0, :]  # [batch, length]
-
-    def compute_grad(self, x, layer_name):
-        """
-        Update running mean/variance of gradients for a given layer
-        """
-        if layer_name not in self.num_updates:
-            self.num_updates[layer_name] = 0
-        self.num_updates[layer_name] += 1
-
-        x = nan_checker(x)
-        grad_Y = self.get_gradient(x)
-        mean = jnp.mean(grad_Y, axis=0)
-        var = jnp.var(grad_Y, axis=0)
-
-        if layer_name not in self.mean_grad:
-            self.mean_grad[layer_name] = mean
-            self.var_grad[layer_name] = var
-        else:
-            n = self.num_updates[layer_name]
-            self.mean_grad[layer_name] += (mean - self.mean_grad[layer_name]) / n
-            self.var_grad[layer_name] += (var - self.var_grad[layer_name]) / n
-
-    def forward(self, output, layer_name):
-        if (
-            layer_name not in self.mean_grad
-            or self.mean_grad[layer_name] is None
-            or self.var_grad[layer_name] is None
-        ):
-            return output
-
-        output = nan_checker(output)
-
-        mean_grad_tensor = jnp.array(self.mean_grad[layer_name], dtype=jnp.float32)
-        std_grad_tensor = jnp.sqrt(jnp.array(self.var_grad[layer_name], dtype=jnp.float32))
-
-        lower_bound = mean_grad_tensor - self.k * std_grad_tensor
-        upper_bound = mean_grad_tensor + self.k * std_grad_tensor
-
-        grad_Y = self.get_gradient(output)
-
-        mask = (grad_Y < lower_bound) | (grad_Y > upper_bound)
-
-        # zero out abnormal activations
-        new_output = jnp.where(mask, 0.0, output)
-
-        return new_output
-
 def random_SSM(rng, N):
     a_r, b_r, c_r = jax.random.split(rng, 3)
     A = jax.random.uniform(a_r, (N, N))
@@ -133,6 +26,60 @@ def discretize(A, B, C, step):
     Ab = BL @ (I + (step / 2.0) * A)
     Bb = (BL * step) @ B
     return Ab, Bb, C
+
+def flip_random_bit(x, rng, error_rate=1e-5):
+    """
+    Flip a random bit in each element of x with probability error_rate.
+    x: float32 array
+    rng: JAX PRNGKey
+    """
+    # Flatten array for simplicity
+    x_flat = x.ravel()
+    n = x_flat.size
+
+    rng, mask_rng, bit_rng = jax.random.split(rng, 3)
+    
+    # Decide which elements to flip
+    flip_mask = jax.random.bernoulli(mask_rng, error_rate, shape=(n,))
+    # jax.debug.print("flip_mask = {x}", x=flip_mask)
+    
+    # Random bit indices for each element
+    bit_idx = jax.random.randint(bit_rng, shape=(n,), minval=0, maxval=64)
+    
+    # View as uint32
+    x_real = x_flat.real
+    x_bits = x_real.view(jnp.uint32)
+    # print(x_bits)
+
+    # Create flip mask
+    flip_mask_uint = (1 << bit_idx) * flip_mask.astype(jnp.uint32)
+
+    # Apply flips
+    x_bits_flipped = x_bits ^ flip_mask_uint
+
+    # Convert back to float32 and replace real part
+    x_real_flipped = x_bits_flipped.view(jnp.float32)
+    x_out = x_flat.at[:].set(x_real_flipped + 1j * x_flat.imag)
+
+    return x_out, rng
+
+def scan_SSM_faulty(Ab, Bb, Cb, u, x0, rng, error_rate=1e-5):
+    carry0 = (x0, rng)
+    def step(carry, u_k):
+        x_k_1, rng = carry
+
+        x_k = Ab @ x_k_1 + Bb @ u_k
+        y_k = Cb @ x_k
+        
+        rng, rng_x, rng_y = jax.random.split(rng, 3)
+        x_k, rng_x = flip_random_bit(x_k, rng_x, error_rate=error_rate)
+        y_k, rng_y = flip_random_bit(y_k, rng_y, error_rate=error_rate)
+
+        carry = (x_k, rng)
+        return carry, (x_k, y_k)
+    
+    (final_k, _), outputs = jax.lax.scan(step, carry0, u)
+    return outputs
 
 def scan_SSM(Ab, Bb, Cb, u, x0):
     def step(x_k_1, u_k):
@@ -263,7 +210,8 @@ class SSMLayer(nn.Module):
         self.K = K_conv(*self.ssm, self.l_max)
 
         # RNN cache for long sequences
-        self.x_k_1 = self.variable("cache", "cache_x_k", jnp.zeros, (self.N,))
+        if self.decode:
+            self.x_k_1 = self.variable("cache", "cache_x_k", jnp.zeros, (self.N,))
 
     def __call__(self, u):
         if not self.decode:
@@ -271,6 +219,7 @@ class SSMLayer(nn.Module):
             return causal_convolution(u, self.K) + self.D * u
         else:
             # RNN Mode
+            # jax.debug.print("AY IM DECODIN ERE")
             x_k, y_s = scan_SSM(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value)
             if self.is_mutable_collection("cache"):
                 self.x_k_1.value = x_k
@@ -301,7 +250,7 @@ class SequenceBlock(nn.Module):
     name: str = "block"
 
     def setup(self):
-        self.seq = self.layer_cls(**self.layer, decode=self.decode)
+        self.seq = self.layer_cls(**self.layer, decode=self.decode, inject_fault=self.inject_fault)
         self.norm = nn.LayerNorm()
         self.out = nn.Dense(self.d_model)
         if self.glu:
@@ -311,7 +260,7 @@ class SequenceBlock(nn.Module):
             broadcast_dims=[0],
             deterministic=not self.training,
         )
-        self.corr = CorrectionModuleDense(k=4)
+        # self.corr = CorrectionModuleDense(k=4)
 
     def __call__(self, x):
         skip = x
@@ -327,13 +276,13 @@ class SequenceBlock(nn.Module):
         if not self.prenorm:
             x = self.norm(x)
         # TODO: add fault injection
-        if not self.training:
-            if self.compute_grad:
-                print('computing grad for layer', self.name)
-                self.corr.compute_grad(x, layer_name=self.name)
-            if self.inject_fault:
-                x = random_bitflip(x, error_rate=1e-3)
-                x = self.corr.forward(x, layer_name=self.name)
+        # if not self.training:
+        #     if self.compute_grad:
+        #         print('computing grad for layer', self.name)
+        #         self.corr.compute_grad(x, layer_name=self.name)
+        #     if self.inject_fault:
+        #         x = random_bitflip(x, error_rate=1e-3)
+        #         x = self.corr.forward(x, layer_name=self.name)
         return x
 
 class Embedding(nn.Embed):
@@ -667,6 +616,7 @@ class S4Layer(nn.Module):
     N: int
     l_max: int
     decode: bool = False
+    inject_fault: bool = False
 
     # Special parameters with multiplicative factor on lr and no weight decay (handled by main train script)
     lr = {
@@ -694,6 +644,8 @@ class S4Layer(nn.Module):
         self.C = self.C[..., 0] + 1j * self.C[..., 1]
         self.D = self.param("D", nn.initializers.ones, (1,))
         self.step = jnp.exp(self.param("log_step", log_step_initializer(), (1,)))
+
+        self.rng = jax.random.PRNGKey(0)
 
         if not self.decode:
             # CNN mode, compute kernel.
@@ -739,8 +691,11 @@ class S4Layer(nn.Module):
             return causal_convolution(u, self.K) + self.D * u
         else:
             # RNN Mode
-            # print("RNN mode")
-            x_k, y_s = scan_SSM(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value)
+            if not self.inject_fault:
+                x_k, y_s = scan_SSM(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value)
+            else:
+                # jax.debug.print("doin faulty stuff")
+                x_k, y_s = scan_SSM_faulty(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value, rng=self.rng, error_rate=1e-3)
             if self.is_mutable_collection("cache"):
                 self.x_k_1.value = x_k
             return y_s.reshape(-1).real + self.D * u
@@ -784,8 +739,8 @@ def init_recurrence(model, params, init_x, rng):
     variables = model.init(rng, init_x)
     vars = {
         "params": params,
-        "cache": variables["cache"].unfreeze(),
-        "prime": variables["prime"].unfreeze(),
+        "cache": variables["cache"],# .unfreeze()
+        "prime": variables["prime"],# .unfreeze()
     }
     print("[*] Priming")
     _, prime_vars = model.apply(vars, init_x, mutable=["prime"])
