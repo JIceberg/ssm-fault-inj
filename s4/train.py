@@ -71,9 +71,9 @@ def create_train_state(
     total_steps=-1,
 ):
     model = model_cls(training=True)
-    init_rng, dropout_rng = jax.random.split(rng, num=2)
+    init_rng, dropout_rng, fault_rng = jax.random.split(rng, num=3)
     variables = model.init(
-        {"params": init_rng, "dropout": dropout_rng},
+        {"params": init_rng, "dropout": dropout_rng, "fault": fault_rng},
         np.array(next(iter(trainloader))[0].numpy())
     )
     print("variable keys:",variables.keys())
@@ -157,7 +157,6 @@ def create_train_state(
 def train_epoch(state, rng, model, trainloader, variables, classification=False):
     # Store Metrics
     model = model(training=True, decode=False)
-    # model.inject_fault = True
     batch_losses, batch_accuracies = [], []
     for batch_idx, (inputs, labels) in enumerate(tqdm(trainloader)):
         inputs = np.array(inputs.numpy())
@@ -184,27 +183,16 @@ def train_epoch(state, rng, model, trainloader, variables, classification=False)
     )
 
 
-def validate(variables, model, testloader, classification=False):
+def validate(variables, rng, model, testloader, classification=False):
     # Compute average loss & accuracy
     model = model(training=False, decode=True)
-    # model.inject_fault = False
-    # model.compute_grad = True
     losses, accuracies = [], []
-    # for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
-    #     inputs = np.array(inputs.numpy())
-    #     labels = np.array(labels.numpy())  # Not the most efficient...
-    #     loss, acc = eval_step(
-    #         inputs, labels, variables, 
-    #         model=model,
-    #         classification=classification,
-    #     )
     model.inject_fault = True
-    # model.compute_grad = False
     for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
         inputs = np.array(inputs.numpy())
         labels = np.array(labels.numpy())  # Not the most efficient...
         loss, acc = eval_step(
-            inputs, labels, variables, 
+            inputs, labels, rng, variables, 
             model=model,
             classification=classification,
         )
@@ -245,6 +233,7 @@ def train_step(
     
 ): 
     # model = model.clone(inject_fault=True)
+    # print(rng)
     def loss_fn(params, variables):
         logits, mod_vars = model.apply(
             {"params": params},
@@ -265,13 +254,16 @@ def train_step(
     return state, loss, acc
 
 
-@partial(jax.jit, static_argnums=(3, 4))
-def eval_step(batch_inputs, batch_labels, variables, model, classification=False):
+@partial(jax.jit, static_argnums=(4, 5))
+def eval_step(batch_inputs, batch_labels, rng, variables, model, classification=False):
+    # print(rng)
     if not classification:
         batch_labels = batch_inputs[:, :, 0]
-    logits = model.apply(
+    logits, mod_vars = model.apply(
         variables,
         batch_inputs,
+        rngs={"fault": rng},
+        mutable=["cache", "prime"]
     )
     loss = np.mean(cross_entropy_loss(logits, batch_labels))
     acc = np.mean(compute_accuracy(logits, batch_labels))
@@ -336,6 +328,8 @@ def example_train(
     key = jax.random.PRNGKey(seed)
     key, rng, train_rng = jax.random.split(key, num=3)
 
+    fault_rng = jax.random.PRNGKey(0)
+
     # Check if classification dataset
     classification = "classification" in dataset
 
@@ -388,12 +382,12 @@ def example_train(
 
         print(f"[*] Running Epoch {epoch + 1} Validation...")
         start = np.array(next(iter(testloader))[0].numpy())
-        start = np.zeros_like(start)
         # params, prime, cache = init_recurrence(model, params, start[:, :-1], rng)
-        params, prime, cache = init_recurrence(model_cls(training=False, decode=True), state.params, start, rng)
+        params, prime, cache = init_recurrence(model_cls(training=False, decode=True), state.params, start, fault_rng)
         val_variables = {"params": params, "prime": prime, "cache": cache}
+        # print("test_rng", test_rng)
         test_loss, test_acc = validate(
-            val_variables, model_cls, testloader, classification=classification
+            val_variables, fault_rng, model_cls, testloader, classification=classification
         )
 
         print(f"\n=>> Epoch {epoch + 1} Metrics ===")

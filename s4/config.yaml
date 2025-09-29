@@ -10,7 +10,7 @@ model:
   decode: false
   embedding: false
   layer:
-    N: 128
+    N: 64
 
 train:
   epochs: 10

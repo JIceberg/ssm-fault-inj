@@ -1,6 +1,8 @@
 from functools import partial
 import jax
 import jax.numpy as jnp
+from jax import lax
+import flax
 import numpy as np
 from flax import linen as nn
 from jax.nn.initializers import lecun_normal, normal
@@ -27,41 +29,99 @@ def discretize(A, B, C, step):
     Bb = (BL * step) @ B
     return Ab, Bb, C
 
-def flip_random_bit(x, rng, error_rate=1e-5):
+def flip_random_bit_real(x, key):
+    real = jnp.real(x)
+    imag = jnp.imag(x)
+    
+    real_int = real.view(jnp.int32)
+    
+    # Only flip mantissa bits: bits 0-22
+    key, subkey = jax.random.split(key)
+    bit_to_flip = jax.random.randint(subkey, (), 0, 23)
+    
+    mask = 1 << bit_to_flip
+    real_flipped_int = real_int ^ mask
+    
+    real_flipped = real_flipped_int.view(jnp.float32)
+    
+    # Optionally, clip very large values
+    real_flipped = jnp.clip(real_flipped, -1e38, 1e38)
+    
+    return jnp.array(real_flipped + 1j * imag, dtype=jnp.complex64), key
+
+def flip_random_element_bit(arr, key):
     """
-    Flip a random bit in each element of x with probability error_rate.
-    x: float32 array
-    rng: JAX PRNGKey
+    Flip a random bit in the real part of a random element of a complex64 array.
+    
+    Args:
+        arr: JAX array of complex64, any shape
+        key: JAX PRNGKey
+        
+    Returns:
+        new array with one random element modified
+        updated key
     """
-    # Flatten array for simplicity
-    x_flat = x.ravel()
-    n = x_flat.size
-
-    rng, mask_rng, bit_rng = jax.random.split(rng, 3)
+    # Flatten the array to pick a single element
+    flat_arr = arr.ravel()
     
-    # Decide which elements to flip
-    flip_mask = jax.random.bernoulli(mask_rng, error_rate, shape=(n,))
-    # jax.debug.print("flip_mask = {x}", x=flip_mask)
+    key, subkey = jax.random.split(key)
+    idx = jax.random.randint(subkey, (), 0, flat_arr.size)
     
-    # Random bit indices for each element
-    bit_idx = jax.random.randint(bit_rng, shape=(n,), minval=0, maxval=64)
+    # Flip bit for the selected element
+    new_val, key = flip_random_bit_real(flat_arr[idx], key)
     
-    # View as uint32
-    x_real = x_flat.real
-    x_bits = x_real.view(jnp.uint32)
-    # print(x_bits)
+    # Use jax.ops.index_update to replace the value
+    flat_arr = flat_arr.at[idx].set(new_val)
+    
+    # Reshape back to original shape
+    return flat_arr.reshape(arr.shape), key
 
-    # Create flip mask
-    flip_mask_uint = (1 << bit_idx) * flip_mask.astype(jnp.uint32)
+def flip_arr_random_bit(arr, key, error_rate=1e-5):
+    """
+    Flip a random mantissa bit in the real part of each element with probability `error_rate`.
+    
+    Args:
+        arr: complex64 JAX array of any shape
+        key: JAX PRNGKey
+        error_rate: probability each element is flipped
+    
+    Returns:
+        new array, updated key
+    """
+    shape = arr.shape
+    flat_arr = arr.ravel()
+    n = flat_arr.size
+    
+   # Advance the key: split into (returned_key, work_key).
+    # We'll return `returned_key` to the caller so RNG state is advanced.
+    returned_key, work_key = jax.random.split(key)
 
-    # Apply flips
-    x_bits_flipped = x_bits ^ flip_mask_uint
+    # From work_key derive:
+    # - mask_key for flip mask
+    # - elems_key to split into per-element keys
+    mask_key, elems_key = jax.random.split(work_key)
+    
+    # Mask: which elements to flip
+    flip_mask = jax.random.uniform(mask_key, (n,)) < error_rate
+    # jax.debug.print("will flip? {x}", x=jnp.any(flip_mask))
+    
+    if n == 0:
+        return flat_arr.reshape(shape), returned_key
 
-    # Convert back to float32 and replace real part
-    x_real_flipped = x_bits_flipped.view(jnp.float32)
-    x_out = x_flat.at[:].set(x_real_flipped + 1j * x_flat.imag)
+    elem_keys = jax.random.split(elems_key, n)
 
-    return x_out, rng
+    # vmap over elements calling the scalar function. The scalar function returns (val, new_key)
+    # we ignore the returned per-element keys (they're consumed), and only keep the returned value.
+    def maybe_flip(val, k, do_flip):
+        # call the provided scalar function (which returns new_val, updated_key)
+        new_val, _ = flip_random_bit_real(val, k)
+        # if do_flip False, keep original val; else use new_val
+        return jnp.where(do_flip, new_val, val)
+
+    # vectorize across the flattened arrays
+    flat_out = jax.vmap(maybe_flip)(flat_arr, elem_keys, flip_mask)
+    
+    return flat_out.reshape(shape), returned_key
 
 def scan_SSM_faulty(Ab, Bb, Cb, u, x0, rng, error_rate=1e-5):
     carry0 = (x0, rng)
@@ -72,8 +132,8 @@ def scan_SSM_faulty(Ab, Bb, Cb, u, x0, rng, error_rate=1e-5):
         y_k = Cb @ x_k
         
         rng, rng_x, rng_y = jax.random.split(rng, 3)
-        x_k, rng_x = flip_random_bit(x_k, rng_x, error_rate=error_rate)
-        y_k, rng_y = flip_random_bit(y_k, rng_y, error_rate=error_rate)
+        x_k, rng_x = flip_random_element_bit(x_k, rng_x)
+        y_k, rng_y = flip_random_element_bit(y_k, rng_y)
 
         carry = (x_k, rng)
         return carry, (x_k, y_k)
@@ -231,7 +291,7 @@ def cloneLayer(layer):
         in_axes=1,
         out_axes=1,
         variable_axes={"params": 1, "cache": 1, "prime": 1},
-        split_rngs={"params": True},
+        split_rngs={"params": True, "fault": True},
     )
 
 SSMLayer = cloneLayer(SSMLayer)
@@ -246,11 +306,13 @@ class SequenceBlock(nn.Module):
     training: bool = True
     decode: bool = False
     inject_fault: bool = False
-    compute_grad: bool = False
-    name: str = "block"
 
     def setup(self):
-        self.seq = self.layer_cls(**self.layer, decode=self.decode, inject_fault=self.inject_fault)
+        self.seq = self.layer_cls(
+            **self.layer,
+            decode=self.decode,
+            inject_fault=self.inject_fault
+        )
         self.norm = nn.LayerNorm()
         self.out = nn.Dense(self.d_model)
         if self.glu:
@@ -260,12 +322,15 @@ class SequenceBlock(nn.Module):
             broadcast_dims=[0],
             deterministic=not self.training,
         )
-        # self.corr = CorrectionModuleDense(k=4)
 
     def __call__(self, x):
         skip = x
         if self.prenorm:
             x = self.norm(x)
+        # if self.inject_fault:
+        #     jax.debug.print("{x}", x=self.scope.rngs)
+        #     fault_rng = self.make_rng("fault")
+        #     self.seq.apply(rngs={"fault": fault_rng})
         x = self.seq(x)
         x = self.drop(nn.gelu(x))
         if self.glu:
@@ -275,14 +340,6 @@ class SequenceBlock(nn.Module):
         x = skip + self.drop(x)
         if not self.prenorm:
             x = self.norm(x)
-        # TODO: add fault injection
-        # if not self.training:
-        #     if self.compute_grad:
-        #         print('computing grad for layer', self.name)
-        #         self.corr.compute_grad(x, layer_name=self.name)
-        #     if self.inject_fault:
-        #         x = random_bitflip(x, error_rate=1e-3)
-        #         x = self.corr.forward(x, layer_name=self.name)
         return x
 
 class Embedding(nn.Embed):
@@ -307,7 +364,6 @@ class StackedModel(nn.Module):
     classification: bool = False
     training: bool = True
     inject_fault: bool = False
-    compute_grad: bool = False
     decode: bool = False  # Probably should be moved into layer_args
 
     def setup(self):
@@ -326,11 +382,11 @@ class StackedModel(nn.Module):
                 training=self.training,
                 decode=self.decode,
                 inject_fault=self.inject_fault,
-                compute_grad=self.compute_grad,
-                name=f"layer_{i}",
             )
-            for i in range(self.n_layers)
+            for _ in range(self.n_layers)
         ]
+        for i in range(self.n_layers):
+            setattr(self, f"layer_{i}", self.layers[i])
 
     def __call__(self, x):
         if not self.classification:
@@ -339,8 +395,10 @@ class StackedModel(nn.Module):
             if not self.decode:
                 x = jnp.pad(x[:-1], [(1, 0), (0, 0)])
         x = self.encoder(x)
-        for layer in self.layers:
-            x = layer(x)
+        for i in range(self.n_layers):
+            # if not self.training:
+            #     jax.debug.print("rngs: {x}", x=self.scope.rngs)
+            x = getattr(self, f"layer_{i}")(x)
         if self.classification:
             x = jnp.mean(x, axis=0)
         x = self.decoder(x)
@@ -351,7 +409,7 @@ BatchStackedModel = nn.vmap(
     in_axes=0,
     out_axes=0,
     variable_axes={"params": None, "dropout": None, "cache": 0, "prime": None},
-    split_rngs={"params": False, "dropout": True},
+    split_rngs={"params": False, "dropout": True, "fault": True},
 )
 
 def make_HiPPO(N):
@@ -695,7 +753,11 @@ class S4Layer(nn.Module):
                 x_k, y_s = scan_SSM(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value)
             else:
                 # jax.debug.print("doin faulty stuff")
-                x_k, y_s = scan_SSM_faulty(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value, rng=self.rng, error_rate=1e-3)
+                try:
+                    key = self.make_rng("fault")
+                except flax.errors.InvalidRngError:
+                    key = self.rng
+                x_k, y_s = scan_SSM_faulty(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value, rng=key, error_rate=1e-4)
             if self.is_mutable_collection("cache"):
                 self.x_k_1.value = x_k
             return y_s.reshape(-1).real + self.D * u
@@ -736,14 +798,18 @@ def sample(model, params, prime, cache, x, start, end, rng):
     return jax.lax.fori_loop(start, end, jax.jit(loop), (x, rng, cache))[0]
 
 def init_recurrence(model, params, init_x, rng):
-    variables = model.init(rng, init_x)
+    rng, params_rng, fault_rng = jax.random.split(rng, 3)
+    variables = model.init(
+        {'params': params_rng, 'fault': fault_rng},
+        init_x
+    )
     vars = {
         "params": params,
         "cache": variables["cache"],# .unfreeze()
         "prime": variables["prime"],# .unfreeze()
     }
     print("[*] Priming")
-    _, prime_vars = model.apply(vars, init_x, mutable=["prime"])
+    _, prime_vars = model.apply(vars, init_x, rngs={'fault': fault_rng}, mutable=["prime"])
     return vars["params"], prime_vars["prime"], vars["cache"]
 
 def sample_checkpoint(path, model, length, rng):
