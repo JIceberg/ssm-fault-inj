@@ -103,7 +103,6 @@ def flip_arr_random_bit(arr, key, error_rate=1e-5):
     
     # Mask: which elements to flip
     flip_mask = jax.random.uniform(mask_key, (n,)) < error_rate
-    # jax.debug.print("will flip? {x}", x=jnp.any(flip_mask))
     
     if n == 0:
         return flat_arr.reshape(shape), returned_key
@@ -123,17 +122,33 @@ def flip_arr_random_bit(arr, key, error_rate=1e-5):
     
     return flat_out.reshape(shape), returned_key
 
+def maybe_raise_if_no_flip(x_k, new_x_k):
+    # pred = True if no flip happened
+    pred = jnp.array_equal(x_k, new_x_k)
+
+    def raise_error(_):
+        # Inside JIT, you can't raise Python errors.
+        # Instead, return a NaN array to fail computation
+        return x_k
+
+    def ok(_):
+        return x_k
+
+    # operand is ignored here (_), but you must provide it
+    return jax.lax.cond(pred, raise_error, ok, operand=None)
+
 def scan_SSM_faulty(Ab, Bb, Cb, u, x0, rng, error_rate=1e-5):
     carry0 = (x0, rng)
     def step(carry, u_k):
         x_k_1, rng = carry
+        rng, rng_x, rng_y = jax.random.split(rng, 3)
 
         x_k = Ab @ x_k_1 + Bb @ u_k
+        # new_x_k, rng_x = flip_arr_random_bit(x_k, rng_x, error_rate=error_rate)
+        # x_k = maybe_raise_if_no_flip(x_k, new_x_k)
         y_k = Cb @ x_k
         
-        rng, rng_x, rng_y = jax.random.split(rng, 3)
-        x_k, rng_x = flip_random_element_bit(x_k, rng_x)
-        y_k, rng_y = flip_random_element_bit(y_k, rng_y)
+        # y_k, rng_y = flip_random_element_bit(y_k, rng_y)
 
         carry = (x_k, rng)
         return carry, (x_k, y_k)
@@ -749,15 +764,15 @@ class S4Layer(nn.Module):
             return causal_convolution(u, self.K) + self.D * u
         else:
             # RNN Mode
-            if not self.inject_fault:
-                x_k, y_s = scan_SSM(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value)
-            else:
-                # jax.debug.print("doin faulty stuff")
-                try:
-                    key = self.make_rng("fault")
-                except flax.errors.InvalidRngError:
-                    key = self.rng
-                x_k, y_s = scan_SSM_faulty(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value, rng=key, error_rate=1e-4)
+            # if not self.inject_fault:
+            x_k, y_s = scan_SSM(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value)
+            # else:
+            #     # jax.debug.print("doin faulty stuff")
+            #     try:
+            #         key = self.make_rng("fault")
+            #     except flax.errors.InvalidRngError:
+            #         key = self.rng
+            #     x_k, y_s = scan_SSM_faulty(*self.ssm, u[:, jnp.newaxis], self.x_k_1.value, rng=key, error_rate=1e-4)
             if self.is_mutable_collection("cache"):
                 self.x_k_1.value = x_k
             return y_s.reshape(-1).real + self.D * u

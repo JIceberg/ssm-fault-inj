@@ -12,7 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 from data import Datasets
 from dss import DSSLayer
-from s4 import BatchStackedModel, S4Layer, SSMLayer, sample_image_prefix, init_recurrence
+from s4 import BatchStackedModel, S4Layer, SSMLayer, sample_image_prefix
 from s4d import S4DLayer
 
 
@@ -71,15 +71,14 @@ def create_train_state(
     total_steps=-1,
 ):
     model = model_cls(training=True)
-    init_rng, dropout_rng, fault_rng = jax.random.split(rng, num=3)
+    init_rng, dropout_rng = jax.random.split(rng, num=2)
     variables = model.init(
-        {"params": init_rng, "dropout": dropout_rng, "fault": fault_rng},
-        np.array(next(iter(trainloader))[0].numpy())
+        {"params": init_rng, "dropout": dropout_rng},
+        np.array(next(iter(trainloader))[0].numpy()),
     )
-    print("variable keys:",variables.keys())
+    print("variables:", variables.keys())
     # Note: Added immediate `unfreeze()` to play well w/ Optax. See below!
-    # print("param keys:", params.keys())
-    params = variables["params"] # .unfreeze()
+    params = variables["params"]# .unfreeze()
 
     # Handle learning rates:
     # - LR scheduler
@@ -154,20 +153,19 @@ def create_train_state(
 # We define the step functions on a model-specific basis below.
 
 
-def train_epoch(state, rng, model, trainloader, variables, classification=False):
+def train_epoch(state, variables, rng, model, trainloader, classification=False):
     # Store Metrics
-    model = model(training=True, decode=False)
+    model = model(training=True)
     batch_losses, batch_accuracies = [], []
     for batch_idx, (inputs, labels) in enumerate(tqdm(trainloader)):
         inputs = np.array(inputs.numpy())
         labels = np.array(labels.numpy())  # Not the most efficient...
-        # print(inputs.shape, labels.shape)
         rng, drop_rng = jax.random.split(rng)
         state, loss, acc = train_step(
             state,
+            variables,
             drop_rng,
             inputs,
-            variables,
             labels,
             model,
             classification=classification,
@@ -183,18 +181,15 @@ def train_epoch(state, rng, model, trainloader, variables, classification=False)
     )
 
 
-def validate(variables, rng, model, testloader, classification=False):
+def validate(variables, model, testloader, classification=False):
     # Compute average loss & accuracy
-    model = model(training=False, decode=True)
+    model = model(training=False)
     losses, accuracies = [], []
-    model.inject_fault = True
     for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
         inputs = np.array(inputs.numpy())
         labels = np.array(labels.numpy())  # Not the most efficient...
         loss, acc = eval_step(
-            inputs, labels, rng, variables, 
-            model=model,
-            classification=classification,
+            inputs, labels, variables, model, classification=classification
         )
         losses.append(loss)
         accuracies.append(acc)
@@ -229,17 +224,14 @@ class FeedForwardModel(nn.Module):
 
 @partial(jax.jit, static_argnums=(5, 6))
 def train_step(
-    state, rng, batch_inputs, variables, batch_labels, model, classification=False,
-    
-): 
-    # model = model.clone(inject_fault=True)
-    # print(rng)
+    state, variables, rng, batch_inputs, batch_labels, model, classification=False
+):
     def loss_fn(params, variables):
         logits, mod_vars = model.apply(
-            {"params": params},
+            {"params": params, "cache": variables["cache"], "prime": variables["prime"]},
             batch_inputs,
             rngs={"dropout": rng},
-            mutable=["intermediates", "prime"],
+            mutable=["intermediates"],
         )
         loss = np.mean(cross_entropy_loss(logits, batch_labels))
         acc = np.mean(compute_accuracy(logits, batch_labels))
@@ -254,15 +246,13 @@ def train_step(
     return state, loss, acc
 
 
-@partial(jax.jit, static_argnums=(4, 5))
-def eval_step(batch_inputs, batch_labels, rng, variables, model, classification=False):
-    # print(rng)
+@partial(jax.jit, static_argnums=(3, 4))
+def eval_step(batch_inputs, batch_labels, variables, model, classification=False):
     if not classification:
         batch_labels = batch_inputs[:, :, 0]
-    logits, mod_vars = model.apply(
+    logits, _ = model.apply(
         variables,
         batch_inputs,
-        rngs={"fault": rng},
         mutable=["cache", "prime"]
     )
     loss = np.mean(cross_entropy_loss(logits, batch_labels))
@@ -328,8 +318,6 @@ def example_train(
     key = jax.random.PRNGKey(seed)
     key, rng, train_rng = jax.random.split(key, num=3)
 
-    fault_rng = jax.random.PRNGKey(0)
-
     # Check if classification dataset
     classification = "classification" in dataset
 
@@ -373,21 +361,16 @@ def example_train(
         print(f"[*] Starting Training Epoch {epoch + 1}...")
         state, train_loss, train_acc = train_epoch(
             state,
+            variables,
             train_rng,
             model_cls,
             trainloader,
-            variables,
             classification=classification,
         )
 
         print(f"[*] Running Epoch {epoch + 1} Validation...")
-        start = np.array(next(iter(testloader))[0].numpy())
-        # params, prime, cache = init_recurrence(model, params, start[:, :-1], rng)
-        params, prime, cache = init_recurrence(model_cls(training=False, decode=True), state.params, start, fault_rng)
-        val_variables = {"params": params, "prime": prime, "cache": cache}
-        # print("test_rng", test_rng)
         test_loss, test_acc = validate(
-            val_variables, fault_rng, model_cls, testloader, classification=classification
+            variables, model_cls, testloader, classification=classification
         )
 
         print(f"\n=>> Epoch {epoch + 1} Metrics ===")
