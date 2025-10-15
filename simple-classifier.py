@@ -6,6 +6,17 @@ from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
 
+# np.random.seed(42)
+# torch.random.manual_seed(42)
+
+def nan_checker(x):
+    nan_check = torch.isnan(x)
+    inf_check = torch.isinf(x)
+    if torch.sum(nan_check) or torch.sum(inf_check):
+        x = x.masked_fill_(nan_check,0)
+        x = x.masked_fill_(inf_check,0)
+    return x  
+
 def flip_bits(A, error_rate=1e-4, clamp_val=1e6):
     # Flatten tensor for easier manipulation
     flat_output = A.view(-1)
@@ -36,6 +47,141 @@ def flip_bits(A, error_rate=1e-4, clamp_val=1e6):
     
     return modified_output, does_flip
 
+class Correction_Module_dense(nn.Module):
+    def __init__(self):
+        super(Correction_Module_dense, self).__init__()
+        self.mean_grad = {}
+        self.var_grad = {}
+        self.num_updates = {}
+        self.k = 4
+
+    def get_gradient(self, x):
+        convolution_nn = nn.Conv1d(in_channels=1,out_channels=1,kernel_size=3,padding='same',padding_mode='circular')
+        convolution_nn.weight.requires_grad = False 
+        convolution_nn.bias.requires_grad = False 
+        convolution_nn.weight[0] = torch.tensor([-1,1,0],dtype=torch.float)
+        convolution_nn.bias[0] = torch.tensor([0],dtype=torch.float)
+        convolution_nn = convolution_nn.to(x.device)
+
+        grad = []
+        for batchind in range(0, x.shape[0]):
+            gradind = convolution_nn(x[batchind,:].reshape(1,1,x.shape[1])).reshape(1,x.shape[1])
+            grad.append(gradind)
+
+        return torch.stack(grad, dim=0).view(-1, x.shape[1])
+    
+    def compute_grad(self, x, layer_name):
+        if layer_name not in self.num_updates:
+            self.num_updates[layer_name] = 0
+        self.num_updates[layer_name] += 1
+
+        x = nan_checker(x)
+        grad_Y = self.get_gradient(x)
+        mean = grad_Y.mean(dim=0).cpu().detach().numpy()
+        var = grad_Y.var(dim=0).cpu().detach().numpy()
+
+        if layer_name not in self.mean_grad:
+            self.mean_grad[layer_name] = mean
+            self.var_grad[layer_name] = var
+        else:
+            self.mean_grad[layer_name] += (mean - self.mean_grad[layer_name]) / self.num_updates[layer_name]
+            self.var_grad[layer_name] += (var - self.var_grad[layer_name]) / self.num_updates[layer_name]
+
+    def forward(self, output, layer_name):
+        if self.mean_grad[layer_name] is None or self.var_grad[layer_name] is None:
+            return output
+
+        batch_size, num_neurons = output.shape
+        output = nan_checker(output)
+        
+        std_grad = np.sqrt(self.var_grad[layer_name])
+
+        mean_grad_tensor = torch.tensor(self.mean_grad[layer_name], device=output.device)
+        std_grad_tensor = torch.tensor(std_grad, device=output.device)
+
+        lower_bound = mean_grad_tensor - self.k * std_grad_tensor
+        upper_bound = mean_grad_tensor + self.k * std_grad_tensor
+
+        grad_Y = self.get_gradient(output)
+        mask = (grad_Y < lower_bound) | (grad_Y > upper_bound)
+
+        new_output = output.clone()
+        new_output[mask] = 0
+
+        # ground_truth = layer_func(input)
+        # print("old layer:", output[0, mask[0]])
+        # print("new layer:", new_output[0, mask[0]])
+        # print("true layer:", ground_truth[0, mask[0]])
+
+        return new_output
+    
+class Correction_Module_conv(nn.Module):
+    def __init__(self):
+        super(Correction_Module_conv, self).__init__()
+        self.mean_grad = {}
+        self.var_grad = {}
+        self.num_updates = {}
+        self.k = 6
+
+    def get_gradient(self, x):
+        convolution_nn = nn.Conv1d(in_channels=x.shape[2],out_channels=x.shape[2],kernel_size=3,
+            padding='same',padding_mode='circular')
+        convolution_nn.weight.requires_grad = False 
+        convolution_nn.bias.requires_grad = False 
+        convolution_nn.weight[0] = torch.tensor([-1,1,0],dtype=torch.float)
+        convolution_nn.bias[0] = torch.tensor([0],dtype=torch.float)
+        convolution_nn = convolution_nn.to(x.device)
+
+        grads = []
+        for batchind in range(0, x.shape[0]):
+            outtemp = torch.swapaxes(x[batchind,:,:,:], 0, 2)
+            tempout_test = convolution_nn(outtemp)
+            grad = torch.swapaxes(tempout_test, 0, 2)
+            grads.append(grad)
+        
+        grads = torch.stack(grads, dim=0)
+        return grads
+    
+    def compute_grad(self, x, layer_name):
+        if layer_name not in self.num_updates:
+            self.num_updates[layer_name] = 0
+        self.num_updates[layer_name] += 1
+
+        x = nan_checker(x)
+
+        grad_Y = self.get_gradient(x)
+        
+        mean = grad_Y.mean(dim=0).cpu().detach().numpy()
+        var = grad_Y.var(dim=0).cpu().detach().numpy()
+        if layer_name not in self.mean_grad:
+            self.mean_grad[layer_name] = mean
+            self.var_grad[layer_name] = var
+        else:
+            self.mean_grad[layer_name] += (mean - self.mean_grad[layer_name]) / self.num_updates[layer_name]
+            self.var_grad[layer_name] += (var - self.var_grad[layer_name]) / self.num_updates[layer_name]
+
+    def forward(self, output, layer_name):
+        if self.mean_grad[layer_name] is None or self.var_grad[layer_name] is None:
+            return output
+
+        output = nan_checker(output)
+        
+        std_grad = np.sqrt(self.var_grad[layer_name])
+
+        mean_grad_tensor = torch.tensor(self.mean_grad[layer_name], device=output.device)
+        std_grad_tensor = torch.tensor(std_grad, device=output.device)
+
+        lower_bound = mean_grad_tensor - self.k * std_grad_tensor
+        upper_bound = mean_grad_tensor + self.k * std_grad_tensor
+
+        grad_Y = self.get_gradient(output)
+        mask = (grad_Y < lower_bound) | (grad_Y > upper_bound)
+
+        new_output = output.clone()
+        new_output[mask] = 0
+
+        return new_output
+
 # ---------- SSM Layer ----------
 class SSM(nn.Module):
     def __init__(self, d_model, d_state=64):
@@ -50,7 +196,7 @@ class SSM(nn.Module):
         self.activation = nn.GELU()
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, error_rate=1e-3):
+    def forward(self, x, error_rate=1e-4, inject=False):
         B, L, D = x.shape
         device = x.device
         state = torch.zeros(B, self.d_state, device=device)
@@ -71,7 +217,7 @@ class SSM(nn.Module):
         for t in range(L):
             u_t = x[:, t, :]
 
-            if not self.training:
+            if not self.training and inject:
                 state_col_checksum = state.sum(dim=0, keepdim=True)  
                 state_aug = torch.cat([state, state_col_checksum], dim=0)
                 A_check = state_aug @ A_aug.T
@@ -103,7 +249,6 @@ class SSM(nn.Module):
                         num_detected += 1
                     else:
                         false_positives += 1
-                    # restore x_t to previous state if error
                     # x_t = state
             else:
                 x_t = state @ self.A.T + u_t @ self.B.T
@@ -121,15 +266,23 @@ class SSMClassifier(nn.Module):
         super().__init__()
         self.input_proj = nn.Linear(28, d_model)
         self.ssm = SSM(d_model=d_model, d_state=d_state)
+        self.corr_dense = Correction_Module_dense()
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(d_model, n_classes)
 
-    def forward(self, x):
+    def forward(self, x, error_rate=1e-4, compute_grad=False, inject=False, correct=False):
         x = x.squeeze(1)                # (B, 28, 28)
         x = self.input_proj(x)          # (B, 28, d_model)
-        x, flips, detected, fp = self.ssm(x)             
+        x, flips, detected, fp = self.ssm(x, error_rate=error_rate, inject=inject)
         x = x.transpose(1, 2)           # (B, d_model, 28)
         x = self.pool(x).squeeze(-1)    # (B, d_model)
+        if not self.training:
+            if compute_grad:
+                self.corr_dense.compute_grad(x, "ssm_layer")
+            if inject:
+                x, _ = flip_bits(x, error_rate=error_rate)
+                if correct:
+                    x = self.corr_dense(x, "ssm_layer")
         return self.fc(x), flips, detected, fp
 
 
@@ -161,7 +314,7 @@ def train_model(epochs=5, batch_size=64, lr=1e-3, device="cuda"):
             x, y = x.to(device), y.to(device)
 
             optimizer.zero_grad()
-            logits, _, _ ,_ = model(x)
+            logits = model(x)[0]
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()
@@ -179,26 +332,56 @@ def train_model(epochs=5, batch_size=64, lr=1e-3, device="cuda"):
         model.eval()
         correct, total = 0, 0
         with torch.no_grad():
-            flips = detected = fps = 0
-
             for x, y in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=False):
                 x, y = x.to(device), y.to(device)
-                logits, f, d, fp = model(x)
-                flips += f
-                detected += d
-                fps += fp
+                logits = model(x)[0]
                 preds = logits.argmax(dim=1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
         test_acc = correct / total
-        detection_rate = detected / flips if flips > 0 else 0
-        fp_rate = fps / max(1, (total - flips))
-        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f}, Test Acc={test_acc:.4f}, Detection={detection_rate:.4f}, FP={fp_rate:.4f}")
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f}, Test Acc={test_acc:.4f}")
 
-    return model
+    return model, test_loader
 
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_model(epochs=5, device=device)
+    model, test_loader = train_model(epochs=5, device=device)
+
+    # test
+    model.eval()
+    with torch.no_grad():
+        flips = detected = fps = 0
+
+        correct, total = 0, 0
+        for x, y in tqdm(test_loader, desc=f"Compute Grads", leave=False):
+            x, y = x.to(device), y.to(device)
+            logits = model(x, compute_grad=True)[0]
+            preds = logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+        test_acc = correct / total
+        print(f"Test Acc with no Errors={test_acc:.4f}")
+
+        correct, total = 0, 0
+        for x, y in tqdm(test_loader, desc=f"Inject Errors", leave=False):
+            x, y = x.to(device), y.to(device)
+            logits = model(x, error_rate=1e-2, inject=True)[0]
+            preds = logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+        test_acc = correct / total
+        print(f"Test Acc with Errors, Uncorrected={test_acc:.4f}")
+
+        correct, total = 0, 0
+        for x, y in tqdm(test_loader, desc=f"Inject Errors", leave=False):
+            x, y = x.to(device), y.to(device)
+            logits = model(x, error_rate=1e-2, inject=True, correct=True)[0]
+            preds = logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+        test_acc = correct / total
+        print(f"Test Acc with Errors, Corrected={test_acc:.4f}")
+        
+
