@@ -197,20 +197,10 @@ class SSM(nn.Module):
         outputs = []
         for t in range(L):
             u_t = x[:, t, :]
+            x_t = state @ self.A.T + u_t @ self.B.T
 
-            if inject and t % 5 == 0:
-                A = self.A.clone()
-                A[0, 0] = -1e3 * A[0, 0]
-                B = self.B
-                # B, _ = flip_bits_fixed(self.B.clone(), num_flips=1)
-            else:
-                A = self.A
-                B = self.B
-
-            x_t = state @ A.T + u_t @ B.T
-
-            # if inject:
-            #     x_t, _ = flip_bits(x_t, error_rate=error_rate)
+            if inject:
+                x_t, _ = flip_bits(x_t.detach(), error_rate=error_rate)
 
             state = x_t
             y_t = state @ self.C.T
@@ -391,7 +381,16 @@ if __name__ == "__main__":
 
     print(f"Graph with {G_stats.number_of_nodes()} nodes and {G_stats.number_of_edges()} edges.")
 
-    l = 6
+    adj = torch.zeros((N, N), device=device)
+    adj_cov = torch.zeros((N, N), device=device)
+
+    for i, j in G_stats.edges():
+        adj[i, j] = 1
+        adj[j, i] = 1
+        adj_cov[i, j] = cov_matrix[i, j]
+        adj_cov[j, i] = cov_matrix[j, i]
+
+    k = 6
 
     # use test loader with batch size 1 for simplicity
     test_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=False)
@@ -404,44 +403,41 @@ if __name__ == "__main__":
         
         x = images.squeeze(1)                # (B, 28, 28)
         x = model.input_proj(x)          # (B, 28, d_model)
-        x = model.ssm(x, inject=True)
+        x = model.ssm(x, inject=True, error_rate=1e-2)
 
         B, L, D = x.shape
         act = x.reshape(B, L * D).detach()
+        _, N = act.shape
 
-        erroneous_idx = []
-        for i in range(act.size(1)):
-            neighbors = list(G_stats.neighbors(i))
-            # if len(neighbors) == 0:
-            # get node i stats
-            mu_i = node_stats[i]['mu']
-            std_i = node_stats[i]['sigma']
-            # check if h1[:, i] is l std dev away from mu_i
-            mask = (torch.abs(act[:, i] - mu_i) > l * std_i)
-            # h1[mask, i] = torch.tensor(mu_i, dtype=h1.dtype, device=h1.device)
-            if mask.any():
-                erroneous_idx.append(i)
+        mu = torch.tensor([node_stats[i]['mu'] for i in range(N)], device=act.device, dtype=act.dtype)
+        sigma = torch.tensor([node_stats[i]['sigma'] for i in range(N)], device=act.device, dtype=act.dtype)
 
-        # print("Erroneous indices detected:", erroneous_idx)
-        for a_idx in erroneous_idx:
-            neighbors = list(G_stats.neighbors(a_idx))
-            if len(neighbors) == 0:
-                # print(f"Neuron a = {a_idx} has no neighbors, using mean value.")
-                act[:, a_idx] = torch.tensor(node_stats[a_idx]['mu'], dtype=act.dtype, device=act.device).repeat(act.size(0))
-            else:
-                cov_ax = np.array([cov_matrix[a_idx, j] for j in neighbors])             # [1 x k]
-                cov_xx = np.array([[cov_matrix[i, j] for j in neighbors] for i in neighbors])  # [k x k]
+        mu_exp = mu.unsqueeze(0).expand_as(act)
+        sigma_exp = sigma.unsqueeze(0).expand_as(act)
 
-                mu_a = node_stats[a_idx]['mu']
-                mu_x = np.array([node_stats[j]['mu'] for j in neighbors])
+        row_sums = adj_cov.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        W = adj_cov / row_sums  # normalized neighbor weights [N, N]
 
-                x_vals = act[:, neighbors].detach().cpu().numpy()  # activations of neighbors
-                x_centered = x_vals - mu_x
+        centered = act - mu_exp
 
-                val = mu_a + cov_ax @ np.linalg.inv(cov_xx) @ x_centered.T  # [1 x B]
-                act[:, a_idx] = torch.tensor(val, dtype=act.dtype, device=act.device).squeeze()
+        # Aggregate neighbor information
+        pred = mu_exp + centered @ W.T
 
-        x = act.view(B, L, D)
+        # print(pred.shape)
+
+        # handle nodes with no neighbors
+        no_neighbors = (adj.sum(dim=1) == 0)  # [N]
+        pred[:, no_neighbors] = mu[no_neighbors]
+
+        # determine if node value is too far from its expected mean
+        mask_pred = (torch.abs(act - mu_exp) > k * sigma_exp)
+        mask_noneigh = mask_pred & no_neighbors.unsqueeze(0)
+
+        act_updated = act.clone()
+        act_updated = torch.where(mask_pred, pred, act_updated)
+        act_updated = torch.where(mask_noneigh, mu_exp, act_updated)
+
+        # x = act_updated.view(B, L, D)
         x = x.transpose(1, 2).contiguous()      # (B, d_model, 28)
         x = model.pool(x).squeeze(-1)    # (B, d_model)
 

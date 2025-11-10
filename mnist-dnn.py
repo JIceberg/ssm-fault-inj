@@ -179,19 +179,6 @@ with torch.no_grad():
         correct += (preds == labels).sum().item()
 print(f"Base model accuracy on test set: {100 * correct / total:.2f}%")
 
-# test with bit flips
-model.eval()
-correct = 0
-total = 0
-with torch.no_grad():
-    for images, labels in tqdm(test_loader, desc="Testing Faulty Model", leave=False):
-        images, labels = images.to(device), labels.to(device)
-        logits, _ = model(images, inject=True, error_rate=1e-1)
-        preds = torch.argmax(logits, dim=1)
-        total += labels.size(0)
-        correct += (preds == labels).sum().item()
-print(f"Faulty model accuracy on test set: {100 * correct / total:.2f}%")
-
 import random
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -266,12 +253,21 @@ for i, j in G_stats.edges():
 for (i, j), delta in avg_deltas.items():
     G_stats[i][j]['avg_delta'] = delta
 
+adj = torch.zeros((N, N), device=device)
+adj_cov = torch.zeros((N, N), device=device)
+
+for i, j in G_stats.edges():
+    adj[i, j] = 1
+    adj[j, i] = 1
+    adj_cov[i, j] = cov_matrix[i, j]
+    adj_cov[j, i] = cov_matrix[j, i]
+
 import random
 
 # create test loader with batch size 1 for simplicity
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-k, l = 4, 6
+k = 4
 
 model.eval()
 correct = 0
@@ -282,8 +278,6 @@ for images, labels in tqdm(test_loader, desc=f"Testing Model", leave=False):
     x = images.view(images.size(0), -1)
     h1 = model.fc1(x)
 
-    original_h1 = h1.clone()
-
     # select random neuron idx
     random_idx = torch.randint(0, h1.size(1), (1,)).item()
     # flip a random bit in h1[:, random_idx]
@@ -292,44 +286,38 @@ for images, labels in tqdm(test_loader, desc=f"Testing Model", leave=False):
     h1_int_flipped = h1_int ^ bit_to_flip
     h1[:, random_idx] = h1_int_flipped.to(h1.dtype)
 
-    erroneous_idx = []
-    for i in range(h1.size(1)):
-        neighbors = list(G_stats.neighbors(i))
-        # if len(neighbors) == 0:
-        # get node i stats
-        mu_i = node_stats[i]['mu']
-        std_i = node_stats[i]['sigma']
-        # check if h1[:, i] is l std dev away from mu_i
-        mask = (torch.abs(h1[:, i] - mu_i) > l * std_i)
-        # h1[mask, i] = torch.tensor(mu_i, dtype=h1.dtype, device=h1.device)
-        if mask.any():
-            erroneous_idx.append(i)
+    act = h1.clone()
+    B, N = act.shape
 
-    # print("detected idx vs actual idx:", erroneous_idx, random_idx)
+    mu = torch.tensor([node_stats[i]['mu'] for i in range(N)], device=act.device, dtype=act.dtype)
+    sigma = torch.tensor([node_stats[i]['sigma'] for i in range(N)], device=act.device, dtype=act.dtype)
 
-    # print("errored output vs original output", h1[:, random_idx], original_h1[:, random_idx])
+    mu_exp = mu.unsqueeze(0).expand_as(act)
+    sigma_exp = sigma.unsqueeze(0).expand_as(act)
 
-    for a_idx in erroneous_idx:
-        neighbors = list(G_stats.neighbors(a_idx))
-        if len(neighbors) == 0:
-            print(f"Neuron a = {a_idx} has no neighbors, using mean value.")
-            h1[:, a_idx] = torch.tensor(node_stats[a_idx]['mu'], dtype=h1.dtype, device=h1.device).repeat(h1.size(0))
-        else:
-            cov_ax = np.array([cov_matrix[a_idx, j] for j in neighbors])             # [1 x k]
-            cov_xx = np.array([[cov_matrix[i, j] for j in neighbors] for i in neighbors])  # [k x k]
+    row_sums = adj_cov.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    W = adj_cov / row_sums  # normalized neighbor weights [N, N]
 
-            mu_a = node_stats[a_idx]['mu']
-            mu_x = np.array([node_stats[j]['mu'] for j in neighbors])
+    centered = act - mu_exp
 
-            x_vals = h1[:, neighbors].detach().cpu().numpy()  # activations of neighbors
-            x_centered = x_vals - mu_x
+    # Aggregate neighbor information
+    pred = mu_exp + centered @ W.T
 
-            val = mu_a + cov_ax @ np.linalg.inv(cov_xx) @ x_centered.T  # [1 x B]
-            h1[:, a_idx] = torch.tensor(val, dtype=h1.dtype, device=h1.device).squeeze()
+    # print(pred.shape)
 
-        # print("corrected output vs original output:", h1[:, a_idx], original_h1[:, a_idx])
+    # handle nodes with no neighbors
+    no_neighbors = (adj.sum(dim=1) == 0)  # [N]
+    pred[:, no_neighbors] = mu[no_neighbors]
 
-    x = F.relu(h1)
+    # determine if node value is too far from its expected mean
+    mask_pred = (torch.abs(act - mu_exp) > k * sigma_exp)
+    mask_noneigh = mask_pred & no_neighbors.unsqueeze(0)
+
+    act_updated = act.clone()
+    act_updated = torch.where(mask_pred, pred, act_updated)
+    act_updated = torch.where(mask_noneigh, mu_exp, act_updated)
+
+    x = F.relu(act_updated)
     h2 = F.relu(model.fc2(x))
     logits = model.fc3(h2)
 
