@@ -9,8 +9,76 @@ import math
 import argparse
 import os
 import numpy as np
+import time
+import statistics as stats
 import torch.nn.utils.prune as prune
 from matplotlib import pyplot as plt
+
+class Correction_Module_dense(nn.Module):
+    def __init__(self, k=4):
+        super(Correction_Module_dense, self).__init__()
+        self.mean_grad = {}
+        self.var_grad = {}
+        self.num_updates = {}
+        self.k = k
+
+    def get_gradient(self, x):
+        convolution_nn = nn.Conv1d(in_channels=1,out_channels=1,kernel_size=3,padding='same',padding_mode='circular')
+        convolution_nn.weight.requires_grad = False 
+        convolution_nn.bias.requires_grad = False 
+        convolution_nn.weight[0] = torch.tensor([-1,1,0],dtype=torch.float)
+        convolution_nn.bias[0] = torch.tensor([0],dtype=torch.float)
+        convolution_nn = convolution_nn.to(x.device)
+
+        grad = []
+        for batchind in range(0, x.shape[0]):
+            gradind = convolution_nn(x[batchind,:].reshape(1,1,x.shape[1])).reshape(1,x.shape[1])
+            grad.append(gradind)
+
+        return torch.stack(grad, dim=0).view(-1, x.shape[1])
+    
+    def compute_grad(self, x, layer_name):
+        if layer_name not in self.num_updates:
+            self.num_updates[layer_name] = 0
+        self.num_updates[layer_name] += 1
+
+        x = nan_checker(x)
+        grad_Y = self.get_gradient(x)
+        mean = grad_Y.mean(dim=0).cpu().detach().numpy()
+        var = grad_Y.var(dim=0).cpu().detach().numpy()
+
+        if layer_name not in self.mean_grad:
+            self.mean_grad[layer_name] = mean
+            self.var_grad[layer_name] = var
+        else:
+            self.mean_grad[layer_name] += (mean - self.mean_grad[layer_name]) / self.num_updates[layer_name]
+            self.var_grad[layer_name] += (var - self.var_grad[layer_name]) / self.num_updates[layer_name]
+
+    def forward(self, output, layer_name, replace_tensor=None):
+        if self.mean_grad[layer_name] is None or self.var_grad[layer_name] is None:
+            return output
+
+        batch_size, num_neurons = output.shape
+        output = nan_checker(output)
+        
+        std_grad = np.sqrt(self.var_grad[layer_name])
+
+        mean_grad_tensor = torch.tensor(self.mean_grad[layer_name], device=output.device)
+        std_grad_tensor = torch.tensor(std_grad, device=output.device)
+
+        lower_bound = mean_grad_tensor - self.k * std_grad_tensor
+        upper_bound = mean_grad_tensor + self.k * std_grad_tensor
+
+        grad_Y = self.get_gradient(output)
+        mask = (grad_Y < lower_bound) | (grad_Y > upper_bound)
+
+        new_output = output.clone()
+        if replace_tensor is not None:
+            new_output[mask] = replace_tensor[mask]
+        else:
+            new_output[mask] = 0
+
+        return new_output
 
 class Correction_Module_ssm(nn.Module):
     def __init__(self):
@@ -126,6 +194,78 @@ def flip_bits(A, error_rate=1e-4, clamp_val=1e6):
     
     return modified_output, does_flip
 
+def to_float8(x, exp_bits=4, mant_bits=3):
+    max_exp = 2**(exp_bits - 1) - 1
+    min_exp = -max_exp
+    scale = 2.0 ** mant_bits
+
+    sign = torch.sign(x)
+    x_abs = torch.abs(x)
+
+    exp = torch.floor(torch.log2(x_abs + 1e-8))
+    exp = torch.clamp(exp, min_exp, max_exp)
+    mant = x_abs / (2 ** exp) - 1
+    mant_q = torch.round(mant * scale) / scale
+    return sign * (1 + mant_q) * (2 ** exp)
+
+def dequantize_tensor(q_tensor, scale, zero_point=0):
+    return scale * (q_tensor - zero_point)
+
+def row_checksum(A):
+    m, n = A.shape
+    row_sum = torch.sum(A, dim=1).view(m, 1)
+    return torch.cat((A, row_sum), dim=1)
+    
+def col_checksum(B):
+    m, n = B.shape
+    col_sum = torch.sum(B, dim=0).view(1, n)
+    return torch.cat((B, col_sum), dim=0)
+
+def checksum_verify(left, right, epsilon=1e-4, inject=False, error_rate=1e-3, is_pruned=False):
+    """
+    Performs ABFT-style checksum verification for left @ right
+    Returns (output, mask)
+    """
+    left_cs = col_checksum(left)
+    right_cs = row_checksum(right)
+
+    if is_pruned:
+        zeros_mask = torch.isclose(right_cs, torch.zeros_like(right_cs))
+
+    if inject:
+        right_cs, _ = flip_bits(right_cs, error_rate=error_rate)
+        if is_pruned:
+            right_cs[zeros_mask] = 0
+
+    prod_cs = left_cs @ right_cs
+
+    # if inject:
+    #     prod_cs, _ = flip_bits(prod_cs, error_rate=error_rate)
+
+    output = prod_cs[:-1, :-1]
+    row_sum_check = prod_cs[:-1, -1]
+    col_sum_check = prod_cs[-1, :-1]
+
+    col_sum = torch.sum(output, dim=0)
+    row_sum = torch.sum(output, dim=1)
+
+    col_diff = torch.abs(col_sum - col_sum_check)
+    row_diff = torch.abs(row_sum - row_sum_check)
+
+    row_mask = row_diff > epsilon     # shape [m]
+    col_mask = col_diff > epsilon     # shape [n]
+    
+    mask = row_mask.unsqueeze(1) & col_mask.unsqueeze(0)
+    # print(mask)
+
+    return output, mask
+
+def prune_tensor(tensor, amount=0.3):
+    k = int(amount * tensor.numel())
+    threshold = tensor.abs().view(-1).kthvalue(k).values
+    mask = (tensor.abs() >= threshold).float()
+    return tensor * mask, mask
+
 # ---------------------------
 # Simple SSM / S4-like layer
 # ---------------------------
@@ -192,6 +332,92 @@ class SimpleSSM(nn.Module):
         # stack => (L, B, output_dim) -> permute to (B, output_dim, L)
         Y = torch.stack(outputs, dim=0).permute(1, 2, 0).contiguous()
         return Y
+    
+    def single_step(self, state, u):
+        state_next, _ = self.hidden_update(state, u)
+        return state_next, self.get_output(state_next, u)
+    
+    def hidden_update(self, state, u, inject=False, error_rate=1e-3):
+        A, B = self.A_unconstrained, self.B
+        A_diag = -F.softplus(self.A_unconstrained)
+
+        x_term = state * A_diag.unsqueeze(0)
+        u_term, mask = checksum_verify(u, B.t(), inject=inject, error_rate=error_rate)
+
+        state_next = x_term + u_term
+
+        return state_next, mask
+
+    def get_output(self, state, u):
+        C, D = self.C, self.D
+        y = state @ C.t() + (u @ D.t())
+        return y
+    
+class QuantizedSimpleSSM(nn.Module):
+    def __init__(self, A_diag, B, C, D, int_bits=4, mant_bits=3):
+        super().__init__()
+        self.A_diag = nn.Parameter(A_diag.clone())   # shape: (state_dim,)
+        self.B = nn.Parameter(B.clone())             # (state_dim, input_dim)
+        self.C = nn.Parameter(C.clone())             # (output_dim, state_dim)
+        self.D = nn.Parameter(D.clone())             # (output_dim, input_dim)
+        self.int_bits = int_bits
+        self.frac_bits = mant_bits
+
+    def quant(self, t):
+        return to_float8(t, exp_bits=self.int_bits, mant_bits=self.frac_bits)
+
+    def forward(self, u, inject=False, error_rate=1e-3):
+        Bz, input_dim, L = u.shape
+        u_t = u.permute(2,0,1)
+
+        state_dim = self.A_diag.shape[0]
+        state = torch.zeros(Bz, state_dim, device=u.device)
+
+        A_q = self.quant(self.A_diag).unsqueeze(0)  # (1,state_dim)
+        B_q = self.quant(self.B)                    # (state_dim,input_dim)
+        C_q = self.quant(self.C)
+        D_q = self.quant(self.D)
+
+        outputs = []
+        for t in range(L):
+            ut = u_t[t]
+
+            # Diagonal ABFT update = safe elementwise multiply
+            # A is diagonal → no matrix multiply needed
+            state_next = state * A_q
+
+            # ABFT for ut @ B.T
+            right_term, maskB = checksum_verify(ut, B_q.t(), inject=inject, error_rate=error_rate)
+            state_next = state_next + right_term
+
+            if inject:
+                state_next, _ = flip_bits(state_next, error_rate)
+
+            state = self.quant(state_next)
+
+            y_t = state @ C_q.t() + (ut @ D_q.t())
+            y_t = self.quant(y_t)
+            outputs.append(y_t)
+
+        Y = torch.stack(outputs, dim=0).permute(1,2,0)
+        return Y
+    
+    def hidden_update(self, state, u, inject=False, error_rate=1e-3):
+        A_diag = to_float8(self.A_diag, exp_bits=self.int_bits, mant_bits=self.frac_bits)
+        B = to_float8(self.B, exp_bits=self.int_bits, mant_bits=self.frac_bits)
+
+        state_next = state * A_diag.unsqueeze(0)
+        u_term, mask = checksum_verify(u, B.t(), inject=inject, error_rate=error_rate, is_pruned=True)
+
+        state_next = state_next + u_term
+
+        return to_float8(state_next, exp_bits=self.int_bits, mant_bits=self.frac_bits), mask
+
+    def get_output(self, state, u):
+        C = to_float8(self.C, exp_bits=self.int_bits, mant_bits=self.frac_bits)
+        D = to_float8(self.D, exp_bits=self.int_bits, mant_bits=self.frac_bits)
+        y = state @ C.t() + (u @ D.t())
+        return to_float8(y, exp_bits=self.int_bits, mant_bits=self.frac_bits)
 
 # ---------------------------
 # CIFAR-10 model using SSM
@@ -374,61 +600,7 @@ def load_and_test(args):
     corrected_loss, corrected_acc = evaluate(model, testloader, device, eval_criterion,
                                             inject=True, error_rate=1e-3, correct_error=True, desc='Corrected Eval')
     print(f"Corrected Eval - Acc: {corrected_acc:.2f}")
-
-def load_and_get_correlation(args):
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu() else 'cpu')
-    print("Device:", device)
-
-    _, testloader = get_dataloaders(batch_size=args.batch_size, num_workers=args.num_workers, augment=False)
-    model = CIFAR_SSM_Classifier(ssm_state_dim=args.ssm_state_dim, ssm_out_dim=args.ssm_out_dim)
-    model = model.to(device)
-    model.load_state_dict(torch.load(args.save_path, map_location=device)['model_state'])
-
-    num_classes = 10
-    activations_by_class = {i: [] for i in range(num_classes)}
-
-    model.eval()
-    with torch.no_grad():
-        pbar = tqdm(testloader, desc='Getting Correlation', leave=False)
-        for images, targets in pbar:
-            images = images.to(device)
-            targets = targets.to(device)
-            # if inject:
-            #     print(f"Evaluating with fault injection (error rate={error_rate}, correct={correct})")
-            outputs, activations = model(images)
-            activations = activations.cpu()
-            targets = targets.cpu()
-
-            for cls in range(num_classes):
-                mask = (targets == cls)
-                if mask.any():
-                    activations_by_class[cls].append(activations[mask])
     
-    for cls in range(num_classes):
-        if len(activations_by_class[cls]) > 0:
-            activations_by_class[cls] = torch.cat(activations_by_class[cls], dim=0)  # shape [N_cls, num_neurons]
-        else:
-            activations_by_class[cls] = torch.empty(0)
-
-    corr_by_class = {}
-
-    for cls in range(num_classes):
-        acts = activations_by_class[cls].numpy()  # shape [N_cls, num_neurons]
-        
-        if acts.shape[0] > 1:
-            # Transpose so neurons are variables, samples are along axis 1
-            corr = np.corrcoef(acts, rowvar=False)  # shape [num_neurons, num_neurons]
-            corr_by_class[cls] = corr
-        else:
-            corr_by_class[cls] = None  # not enough samples
-
-    for cls in range(num_classes):
-        if corr_by_class[cls] is not None:
-            plt.imshow(corr_by_class[cls], cmap='coolwarm', vmin=-1, vmax=1)
-            plt.colorbar()
-            plt.title(f"Neuron correlation matrix for class {cls}")
-            plt.show()
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -446,5 +618,332 @@ if __name__ == '__main__':
     # main(args)
 
     # load_and_test(args)
+    device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
+    print("Device:", device)
 
-    load_and_get_correlation(args)
+    # 1) Train baseline model if it doesn't exist
+    if not os.path.exists(args.save_path):
+        print("No baseline checkpoint found, training model...")
+        main(args)   # your existing training loop
+
+    # 2) Load baseline model
+    trainloader, testloader = get_dataloaders(batch_size=args.batch_size,
+                                              num_workers=args.num_workers,
+                                              augment=not args.no_augment)
+
+    model = CIFAR_SSM_Classifier(ssm_state_dim=args.ssm_state_dim,
+                                 ssm_out_dim=args.ssm_out_dim).to(device)
+    ckpt = torch.load(args.save_path, map_location=device)
+    model.load_state_dict(ckpt['model_state'])
+    model.eval()
+    print(f"Loaded baseline model from {args.save_path}, best acc = {ckpt.get('acc', 'N/A')}")
+
+    # 3) Build initial quantized SSM from trained SimpleSSM params
+    with torch.no_grad():
+        A_diag_eff = -F.softplus(model.ssm.A_unconstrained.data.clone())  # effective diag
+        B_q = model.ssm.B.data.clone()
+        C_q = model.ssm.C.data.clone()
+        D_q = model.ssm.D.data.clone()
+
+    quantized_ssm = None
+    quant_ckpt_path = "quantized_simple_ssm_cifar.pth"
+
+    if not os.path.exists(quant_ckpt_path):
+        print("Training quantized/pruned SSM via distillation...")
+
+        # multiple pruning stages like in MNIST code
+        for j in range(4):
+            print(f"\n=== Quantized SSM stage {j} ===")
+
+            A_stage = A_diag_eff.clone()
+            B_stage = B_q.clone()
+            C_stage = C_q.clone()
+            D_stage = D_q.clone()
+
+            if j != 0:
+                sparsity = 0.2 + j * 0.1
+                print(f"Applying sparsity {sparsity:.2f}")
+                A_stage, A_mask = prune_tensor(A_stage, amount=sparsity)
+                B_stage, B_mask = prune_tensor(B_stage, amount=sparsity)
+                C_stage, C_mask = prune_tensor(C_stage, amount=sparsity)
+                D_stage, D_mask = prune_tensor(D_stage, amount=sparsity)
+            else:
+                A_mask = torch.ones_like(A_stage)
+                B_mask = torch.ones_like(B_stage)
+                C_mask = torch.ones_like(C_stage)
+                D_mask = torch.ones_like(D_stage)
+
+            child = QuantizedSimpleSSM(A_stage, B_stage, C_stage, D_stage).to(device)
+            optimizer = torch.optim.Adam(child.parameters(), lr=1e-3)
+            criterion = nn.MSELoss()
+
+            num_epochs = 20
+            for epoch in range(num_epochs):
+                child.train()
+                model.eval()
+                pbar = tqdm(trainloader, desc=f"QSSM Stage {j} Epoch {epoch+1}/{num_epochs}", leave=False)
+                for images, _ in pbar:
+                    images = images.to(device)
+
+                    # stem + pooling to produce sequence input (B, 128, 32)
+                    with torch.no_grad():
+                        z = model.stem(images)           # (B,128,32,32)
+                        z = model.pool_width_to_1(z)     # (B,128,32,1)
+                        z = z.squeeze(-1)                # (B,128,32)
+                    Bz, input_dim, L = z.shape
+
+                    # teacher & student states
+                    state_teacher = torch.zeros(Bz, model.ssm.state_dim, device=device)
+                    state_child = torch.zeros(Bz, child.A_diag.numel(), device=device)
+
+                    loss = 0.0
+                    for t in range(L):
+                        u_t = z[:, :, t]   # (B,input_dim)
+
+                        # teacher single step
+                        state_teacher, y_teacher = model.ssm.single_step(state_teacher, u_t)
+
+                        # student hidden update + output
+                        state_child, _ = child.hidden_update(state_child, u_t)
+                        y_child = child.get_output(state_child, u_t)
+
+                        loss = loss + criterion(state_child, state_teacher.detach()) \
+                                   + criterion(y_child, y_teacher.detach())
+
+                    loss = loss / L
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    # re-apply masks to enforce sparsity
+                    with torch.no_grad():
+                        child.A_diag.mul_(A_mask)
+                        child.B.mul_(B_mask)
+                        child.C.mul_(C_mask)
+                        child.D.mul_(D_mask)
+
+                    pbar.set_postfix(loss=loss.item())
+
+            # checkpoint this stage's child; keep last child as quantized_ssm
+            quantized_ssm = child
+
+            # current sparsity
+            total_params = child.A_diag.numel() + child.B.numel() + child.C.numel() + child.D.numel()
+            zero_params = (child.A_diag == 0).sum().item() + \
+                          (child.B == 0).sum().item() + \
+                          (child.C == 0).sum().item() + \
+                          (child.D == 0).sum().item()
+            sparsity_final = zero_params / total_params
+            print(f"Quantized SimpleSSM sparsity after stage {j}: {sparsity_final*100:.2f}%")
+
+            # quick eval of quantized SSM integrated into classifier
+            child.eval()
+            correct, total = 0, 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc=f"Testing Quantized SSM Stage {j}", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    # feeder: stem -> our quantized SSM -> head
+                    z = model.stem(images)           # (B,128,32,32)
+                    z = model.pool_width_to_1(z)     # (B,128,32,1)
+                    z = z.squeeze(-1)                # (B,128,32)
+                    Bz, input_dim, L = z.shape
+
+                    state_q = torch.zeros(Bz, child.A_diag.numel(), device=device)
+                    outputs = []
+                    for t in range(L):
+                        u_t = z[:, :, t]
+                        state_q, _ = child.hidden_update(state_q, u_t)
+                        y_t = child.get_output(state_q, u_t)
+                        outputs.append(y_t)
+
+                    y_seq = torch.stack(outputs, dim=2)     # (B, out_dim, L)
+                    logits = model.head(y_seq)              # reuse existing head
+                    preds = logits.argmax(dim=1)
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100*correct/total)
+
+            test_acc = correct / total
+            print(f"Quantized SSM Stage {j} Test Acc = {test_acc:.4f}")
+
+        # save last child as final quantized SSM
+        torch.save(quantized_ssm.state_dict(), quant_ckpt_path)
+        print("Saved quantized SSM to", quant_ckpt_path)
+
+    else:
+        print("Quantized SSM model already exists at", quant_ckpt_path)
+        with torch.no_grad():
+            A_diag_eff = -F.softplus(model.ssm.A_unconstrained.data.clone())
+            B_q = model.ssm.B.data.clone()
+            C_q = model.ssm.C.data.clone()
+            D_q = model.ssm.D.data.clone()
+        quantized_ssm = QuantizedSimpleSSM(A_diag_eff, B_q, C_q, D_q).to(device)
+        quantized_ssm.load_state_dict(torch.load(quant_ckpt_path, map_location=device))
+        quantized_ssm.eval()
+
+    # ------------------------------------------------------------
+    # PRINT SPARSITY OF QUANTIZED SSM
+    # ------------------------------------------------------------
+    with torch.no_grad():
+        A_nonzero = (quantized_ssm.A_diag != 0).sum().item()
+        B_nonzero = (quantized_ssm.B != 0).sum().item()
+        C_nonzero = (quantized_ssm.C != 0).sum().item()
+        D_nonzero = (quantized_ssm.D != 0).sum().item()
+
+        A_total = quantized_ssm.A_diag.numel()
+        B_total = quantized_ssm.B.numel()
+        C_total = quantized_ssm.C.numel()
+        D_total = quantized_ssm.D.numel()
+
+        total_nonzero = A_nonzero + B_nonzero + C_nonzero + D_nonzero
+        total_params = A_total + B_total + C_total + D_total
+
+        print("\n========== Quantized SSM Sparsity ==========")
+        print(f"A_diag sparsity: {(1 - A_nonzero / A_total) * 100:.2f}%")
+        print(f"B sparsity:      {(1 - B_nonzero / B_total) * 100:.2f}%")
+        print(f"C sparsity:      {(1 - C_nonzero / C_total) * 100:.2f}%")
+        print(f"D sparsity:      {(1 - D_nonzero / D_total) * 100:.2f}%")
+        print("--------------------------------------------")
+        print(f"Total sparsity:  {(1 - total_nonzero / total_params) * 100:.2f}%")
+        print("============================================\n")
+
+
+    # ------------------------------------------------------------
+    # TEST ACCURACY OF QUANTIZED SSM IN THE FULL CLASSIFIER
+    # ------------------------------------------------------------
+    correct = 0
+    total = 0
+    quantized_ssm.eval()
+    model.eval()
+
+    grad_collector = Correction_Module_dense(k=4)
+    external_corrector = Correction_Module_ssm()
+    diff_vals = []
+
+    with torch.no_grad():
+        pbar = tqdm(testloader, desc="Eval Quantized SSM", leave=False)
+        for images, targets in pbar:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            if images.size(0) != args.batch_size:
+                continue
+
+            # Run stem -> quantized SSM -> head
+            z = model.stem(images)               # (B,128,32,32)
+            z = model.pool_width_to_1(z)         # (B,128,32,1)
+            z = z.squeeze(-1)                    # (B,128,32)
+
+            Bz, input_dim, L = z.shape
+            teacher_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+            state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+            outputs = []
+            model_outputs = []
+            for t in range(L):
+                u_t = z[:, :, t]                 # (B, input_dim)
+
+                teacher_state, _ = model.ssm.hidden_update(teacher_state, u_t)
+                state, _ = quantized_ssm.hidden_update(state, u_t)
+
+                # grad_collector.compute_grad(teacher_state, f"ssm_state_{t}")
+                diff_vals.append(torch.abs(teacher_state - state))
+
+                y_t = quantized_ssm.get_output(state, u_t)
+                outputs.append(y_t)
+
+                model_y_t = model.ssm.get_output(teacher_state, u_t)
+                model_outputs.append(model_y_t)
+
+            y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+            # external_corrector.compute_grad(y_seq, layer_name="ssm_output")
+
+            logits = model.head(y_seq)
+            preds = logits.argmax(dim=1)
+
+            correct += (preds == targets).sum().item()
+            total += targets.size(0)
+            pbar.set_postfix(acc=100 * correct / total)
+
+    test_acc = 100 * correct / total
+    print(f"Quantized SSM Model Test Accuracy = {test_acc:.2f}%")
+
+    diff_vals = torch.stack(diff_vals, dim=0)  # shape (#steps, B, state_dim)
+
+    mu_diff = diff_vals.mean().item()
+    std_diff = diff_vals.std().item()
+
+    print(f"\n========== Δ Statistics Between Teacher and Quantized SSM ==========")
+    print(f"Mean(|Δ|)     = {mu_diff:.6f}")
+    print(f"Std(|Δ|)      = {std_diff:.6f}")
+    print("==========================================================\n")
+
+    k = 5
+    exec_times = []
+
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+        for images, targets in pbar:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            if images.size(0) != args.batch_size:
+                continue
+
+            # Run stem -> quantized SSM -> head
+            z = model.stem(images)               # (B,128,32,32)
+            z = model.pool_width_to_1(z)         # (B,128,32,1)
+            z = z.squeeze(-1)                    # (B,128,32)
+
+            Bz, input_dim, L = z.shape
+            model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+            quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+            outputs = []
+            for t in range(L):
+                start = time.perf_counter()
+
+                u_t = z[:, :, t]                 # (B, input_dim)
+
+                model_state, mask = model.ssm.hidden_update(model_state, u_t, inject=True, error_rate=5e-5)
+                quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, inject=False, error_rate=5e-5)
+
+                model_state = nan_checker(model_state)
+                quant_state = nan_checker(quant_state)
+                quant_state[quant_mask] = 0
+
+                # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                diff = torch.abs(model_state - quant_state)
+                mask = torch.abs(diff - mu_diff) > k * std_diff
+                model_state[mask] = quant_state[mask]
+
+                y_t = model.ssm.get_output(model_state, u_t)
+                outputs.append(y_t)
+
+                end = time.perf_counter()
+                exec_time = end - start
+                exec_times.append(exec_time)
+
+            y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+            # y_seq = external_corrector(y_seq, "ssm_output")
+
+            logits = model.head(y_seq)
+            preds = logits.argmax(dim=1)
+
+            correct += (preds == targets).sum().item()
+            total += targets.size(0)
+            pbar.set_postfix(acc=100 * correct / total)
+
+    test_acc = 100 * correct / total
+    print(f"Corrected SSM Model Test Accuracy = {test_acc:.2f}%")
+    median_exec_time = stats.median(exec_times) * 1000
+    mean_exec_time = stats.mean(exec_times) * 1000
+    stdev_exec_time = stats.stdev(exec_times) * 1000
+    print(f"Avg execution time={mean_exec_time:.4f} ms")
+    print(f"Median execution time={median_exec_time:.4f} ms")
+
