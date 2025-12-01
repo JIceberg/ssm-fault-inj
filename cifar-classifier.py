@@ -229,18 +229,18 @@ def checksum_verify(left, right, epsilon=1e-4, inject=False, error_rate=1e-3, is
     left_cs = col_checksum(left)
     right_cs = row_checksum(right)
 
-    if is_pruned:
-        zeros_mask = torch.isclose(right_cs, torch.zeros_like(right_cs))
+    # if is_pruned:
+    #     zeros_mask = torch.isclose(right_cs, torch.zeros_like(right_cs))
 
-    if inject:
-        right_cs, _ = flip_bits(right_cs, error_rate=error_rate)
-        if is_pruned:
-            right_cs[zeros_mask] = 0
+    # if inject:
+    #     right_cs, _ = flip_bits(right_cs, error_rate=error_rate)
+    #     if is_pruned:
+    #         right_cs[zeros_mask] = 0
 
     prod_cs = left_cs @ right_cs
 
-    # if inject:
-    #     prod_cs, _ = flip_bits(prod_cs, error_rate=error_rate)
+    if inject:
+        prod_cs, _ = flip_bits(prod_cs, error_rate=error_rate)
 
     output = prod_cs[:-1, :-1]
     row_sum_check = prod_cs[:-1, -1]
@@ -910,7 +910,7 @@ if __name__ == '__main__':
 
                 u_t = z[:, :, t]                 # (B, input_dim)
 
-                model_state, mask = model.ssm.hidden_update(model_state, u_t, inject=True, error_rate=5e-5)
+                model_state, mask = model.ssm.hidden_update(model_state, u_t, inject=True, error_rate=1e-3)
                 quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, inject=False, error_rate=5e-5)
 
                 model_state = nan_checker(model_state)

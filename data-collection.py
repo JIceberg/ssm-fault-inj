@@ -38,7 +38,7 @@ faulty_no_corr_vals = [0.2764, 0.2988, 0.3037]
 faulty_ext_vals = [0.5522, 0.5139, 0.5368]
 faulty_int_vals = [0.7963, 0.7971, 0.7967]
 backup_clean_vals = [0.7291, 0.7308, 0.7299]
-backup_faulty_vals = [0.7351, 0.7303, 0.7301]
+backup_faulty_vals = [0.4112, 0.4836, 0.4703]
 backup_clean_checksum_vals = [0.3884, 0.3045, 0.3468]
 backup_faulty_checksum_vals = [0.3748, 0.4461, 0.3417]
 

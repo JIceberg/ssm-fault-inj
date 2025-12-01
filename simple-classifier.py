@@ -758,7 +758,7 @@ if __name__ == "__main__":
 
                 u_t = x[:, t, :]
                 quantized_state, quant_mask = quantized_ssm.hidden_update(quantized_state, u_t, inject=True, error_rate=5e-5)
-                model_state, _ = model.ssm.hidden_update(model_state, u_t, inject=True, error_rate=5e-5)
+                model_state, _ = model.ssm.hidden_update(model_state, u_t, inject=False, error_rate=5e-5)
 
                 model_state = nan_checker(model_state)
                 quantized_state = nan_checker(quantized_state)
