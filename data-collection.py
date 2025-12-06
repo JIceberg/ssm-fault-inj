@@ -12,8 +12,8 @@ results = {}
 for k, v in raw_data.items():
     acc_mean = statistics.mean(v["acc"])
     time_median = statistics.median(v["time"])
-    # if "gradient" in k:
-    #     continue
+    if "gradient" in k:
+        continue
     results[k] = {
         "acc": acc_mean,
         "time": time_median
