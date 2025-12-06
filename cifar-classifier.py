@@ -13,6 +13,7 @@ import time
 import statistics as stats
 import torch.nn.utils.prune as prune
 from matplotlib import pyplot as plt
+import json
 
 class Correction_Module_dense(nn.Module):
     def __init__(self, k=4):
@@ -221,7 +222,7 @@ def col_checksum(B):
     col_sum = torch.sum(B, dim=0).view(1, n)
     return torch.cat((B, col_sum), dim=0)
 
-def checksum_verify(left, right, epsilon=1e-4, inject=False, error_rate=1e-3, is_pruned=False):
+def checksum_verify(left, right, epsilon=1e-4, weight_inject=False, out_inject=False, error_rate=1e-3, is_pruned=False):
     """
     Performs ABFT-style checksum verification for left @ right
     Returns (output, mask)
@@ -229,17 +230,17 @@ def checksum_verify(left, right, epsilon=1e-4, inject=False, error_rate=1e-3, is
     left_cs = col_checksum(left)
     right_cs = row_checksum(right)
 
-    # if is_pruned:
-    #     zeros_mask = torch.isclose(right_cs, torch.zeros_like(right_cs))
+    if is_pruned:
+        zeros_mask = torch.isclose(right_cs, torch.zeros_like(right_cs))
 
-    # if inject:
-    #     right_cs, _ = flip_bits(right_cs, error_rate=error_rate)
-    #     if is_pruned:
-    #         right_cs[zeros_mask] = 0
+    if weight_inject:
+        right_cs, _ = flip_bits(right_cs, error_rate=error_rate)
+        if is_pruned:
+            right_cs[zeros_mask] = 0
 
     prod_cs = left_cs @ right_cs
 
-    if inject:
+    if out_inject:
         prod_cs, _ = flip_bits(prod_cs, error_rate=error_rate)
 
     output = prod_cs[:-1, :-1]
@@ -298,7 +299,7 @@ class SimpleSSM(nn.Module):
         # Optional initial state bias
         self.h0 = nn.Parameter(torch.zeros(state_dim))
 
-    def forward(self, u, inject=False, error_rate=1e-3):
+    def forward(self, u):
         # u shape: (B, input_dim, L)
         Bz, input_dim, L = u.shape
         assert input_dim == self.input_dim
@@ -320,9 +321,6 @@ class SimpleSSM(nn.Module):
             # A * state => elementwise multiply
             x_t = state * A_diag.unsqueeze(0) + (ut @ self.B.t())  # (B, state_dim)
 
-            if t == 7 and inject:
-                x_t, _ = flip_bits(x_t, error_rate=1)
-
             state = x_t
 
             # y_t = C @ state + D @ u_t
@@ -337,12 +335,13 @@ class SimpleSSM(nn.Module):
         state_next, _ = self.hidden_update(state, u)
         return state_next, self.get_output(state_next, u)
     
-    def hidden_update(self, state, u, inject=False, error_rate=1e-3):
+    def hidden_update(self, state, u, weight_inject=False, out_inject=False, error_rate=1e-3):
         A, B = self.A_unconstrained, self.B
         A_diag = -F.softplus(self.A_unconstrained)
 
         x_term = state * A_diag.unsqueeze(0)
-        u_term, mask = checksum_verify(u, B.t(), inject=inject, error_rate=error_rate)
+        u_term, mask = checksum_verify(u, B.t(), weight_inject=weight_inject,
+                                       out_inject=out_inject, error_rate=error_rate)
 
         state_next = x_term + u_term
 
@@ -366,7 +365,7 @@ class QuantizedSimpleSSM(nn.Module):
     def quant(self, t):
         return to_float8(t, exp_bits=self.int_bits, mant_bits=self.frac_bits)
 
-    def forward(self, u, inject=False, error_rate=1e-3):
+    def forward(self, u):
         Bz, input_dim, L = u.shape
         u_t = u.permute(2,0,1)
 
@@ -387,11 +386,8 @@ class QuantizedSimpleSSM(nn.Module):
             state_next = state * A_q
 
             # ABFT for ut @ B.T
-            right_term, maskB = checksum_verify(ut, B_q.t(), inject=inject, error_rate=error_rate)
+            right_term, maskB = checksum_verify(ut, B_q.t())
             state_next = state_next + right_term
-
-            if inject:
-                state_next, _ = flip_bits(state_next, error_rate)
 
             state = self.quant(state_next)
 
@@ -402,12 +398,13 @@ class QuantizedSimpleSSM(nn.Module):
         Y = torch.stack(outputs, dim=0).permute(1,2,0)
         return Y
     
-    def hidden_update(self, state, u, inject=False, error_rate=1e-3):
+    def hidden_update(self, state, u, weight_inject=False, out_inject=False, error_rate=1e-3):
         A_diag = to_float8(self.A_diag, exp_bits=self.int_bits, mant_bits=self.frac_bits)
         B = to_float8(self.B, exp_bits=self.int_bits, mant_bits=self.frac_bits)
 
         state_next = state * A_diag.unsqueeze(0)
-        u_term, mask = checksum_verify(u, B.t(), inject=inject, error_rate=error_rate, is_pruned=True)
+        u_term, mask = checksum_verify(u, B.t(), weight_inject=weight_inject,
+                                       out_inject=out_inject, error_rate=error_rate, is_pruned=True)
 
         state_next = state_next + u_term
 
@@ -579,32 +576,9 @@ def main(args):
 
     print("Training complete. Best val acc: {:.2f}".format(best_acc))
 
-def load_and_test(args):
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu() else 'cpu')
-    print("Device:", device)
-
-    _, testloader = get_dataloaders(batch_size=args.batch_size, num_workers=args.num_workers, augment=False)
-    model = CIFAR_SSM_Classifier(ssm_state_dim=args.ssm_state_dim, ssm_out_dim=args.ssm_out_dim)
-    model = model.to(device)
-    model.load_state_dict(torch.load(args.save_path, map_location=device)['model_state'])
-
-    eval_criterion = nn.CrossEntropyLoss()
-    clean_loss, clean_acc = evaluate(model, testloader, device, eval_criterion,
-                                     compute_grad=True, desc='Clean Eval (with grad compute)')
-    print(f"Clean Eval - Acc: {clean_acc:.2f}")
-
-    faulty_loss, faulty_acc = evaluate(model, testloader, device, eval_criterion,
-                                       inject=True, error_rate=1e-3, correct_error=False, desc='Faulty Eval (no correction)')
-    print(f"Faulty Eval - Acc: {faulty_acc:.2f}")
-
-    corrected_loss, corrected_acc = evaluate(model, testloader, device, eval_criterion,
-                                            inject=True, error_rate=1e-3, correct_error=True, desc='Corrected Eval')
-    print(f"Corrected Eval - Acc: {corrected_acc:.2f}")
-    
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=40)
+    parser.add_argument('--epochs', type=int, default=80)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=2e-3)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
@@ -617,7 +591,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     # main(args)
 
-    # load_and_test(args)
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
     print("Device:", device)
 
@@ -849,7 +822,7 @@ if __name__ == '__main__':
                 teacher_state, _ = model.ssm.hidden_update(teacher_state, u_t)
                 state, _ = quantized_ssm.hidden_update(state, u_t)
 
-                # grad_collector.compute_grad(teacher_state, f"ssm_state_{t}")
+                grad_collector.compute_grad(teacher_state, f"ssm_state_{t}")
                 diff_vals.append(torch.abs(teacher_state - state))
 
                 y_t = quantized_ssm.get_output(state, u_t)
@@ -859,7 +832,7 @@ if __name__ == '__main__':
                 model_outputs.append(model_y_t)
 
             y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
-            # external_corrector.compute_grad(y_seq, layer_name="ssm_output")
+            external_corrector.compute_grad(y_seq, layer_name="ssm_output")
 
             logits = model.head(y_seq)
             preds = logits.argmax(dim=1)
@@ -882,68 +855,1322 @@ if __name__ == '__main__':
     print("==========================================================\n")
 
     k = 5
-    exec_times = []
 
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
-        for images, targets in pbar:
-            images = images.to(device)
-            targets = targets.to(device)
+    data = {}
+    num_tests = 100
 
-            if images.size(0) != args.batch_size:
-                continue
+    data["nominal"] = {}
+    data["nominal"]["acc"] = []
+    data["nominal"]["time"] = []
+    for test_num in range(num_tests):
+        exec_times = []
 
-            # Run stem -> quantized SSM -> head
-            z = model.stem(images)               # (B,128,32,32)
-            z = model.pool_width_to_1(z)         # (B,128,32,1)
-            z = z.squeeze(-1)                    # (B,128,32)
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+            for images, targets in pbar:
+                images = images.to(device)
+                targets = targets.to(device)
 
-            Bz, input_dim, L = z.shape
-            model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
-            quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+                if images.size(0) != args.batch_size:
+                    continue
 
-            outputs = []
-            for t in range(L):
-                start = time.perf_counter()
+                # Run stem -> quantized SSM -> head
+                z = model.stem(images)               # (B,128,32,32)
+                z = model.pool_width_to_1(z)         # (B,128,32,1)
+                z = z.squeeze(-1)                    # (B,128,32)
 
-                u_t = z[:, :, t]                 # (B, input_dim)
+                Bz, input_dim, L = z.shape
+                model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
 
-                model_state, mask = model.ssm.hidden_update(model_state, u_t, inject=True, error_rate=1e-3)
-                quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, inject=False, error_rate=5e-5)
+                outputs = []
+                for t in range(L):
+                    start = time.perf_counter()
 
-                model_state = nan_checker(model_state)
-                quant_state = nan_checker(quant_state)
-                quant_state[quant_mask] = 0
+                    u_t = z[:, :, t]                 # (B, input_dim)
 
-                # model_state = grad_collector(model_state, f"ssm_state_{t}")
-                diff = torch.abs(model_state - quant_state)
-                mask = torch.abs(diff - mu_diff) > k * std_diff
-                model_state[mask] = quant_state[mask]
+                    model_state, mask = model.ssm.hidden_update(model_state, u_t)
+                    # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
 
-                y_t = model.ssm.get_output(model_state, u_t)
-                outputs.append(y_t)
+                    model_state = nan_checker(model_state)
+                    # quant_state = nan_checker(quant_state)
+                    # quant_state[quant_mask] = 0
 
-                end = time.perf_counter()
-                exec_time = end - start
-                exec_times.append(exec_time)
+                    # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                    # diff = torch.abs(model_state - quant_state)
+                    # mask = torch.abs(diff - mu_diff) > k * std_diff
+                    # model_state[mask] = quant_state[mask]
 
-            y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
-            # y_seq = external_corrector(y_seq, "ssm_output")
+                    y_t = model.ssm.get_output(model_state, u_t)
+                    outputs.append(y_t)
 
-            logits = model.head(y_seq)
-            preds = logits.argmax(dim=1)
+                    end = time.perf_counter()
+                    exec_time = end - start
+                    exec_times.append(exec_time)
 
-            correct += (preds == targets).sum().item()
-            total += targets.size(0)
-            pbar.set_postfix(acc=100 * correct / total)
+                y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                # y_seq = external_corrector(y_seq, "ssm_output")
 
-    test_acc = 100 * correct / total
-    print(f"Corrected SSM Model Test Accuracy = {test_acc:.2f}%")
-    median_exec_time = stats.median(exec_times) * 1000
-    mean_exec_time = stats.mean(exec_times) * 1000
-    stdev_exec_time = stats.stdev(exec_times) * 1000
-    print(f"Avg execution time={mean_exec_time:.4f} ms")
-    print(f"Median execution time={median_exec_time:.4f} ms")
+                logits = model.head(y_seq)
+                preds = logits.argmax(dim=1)
 
+                correct += (preds == targets).sum().item()
+                total += targets.size(0)
+                pbar.set_postfix(acc=100 * correct / total)
+
+        test_acc = correct / total
+        median_exec_time = stats.median(exec_times) * 1000
+
+        data["nominal"]["acc"].append(test_acc)
+        data["nominal"]["time"].append(median_exec_time)
+    
+    error_rates = [1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
+
+    for error_rate in error_rates:
+        key = f"no-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
+
+                        model_state = nan_checker(model_state)
+                        # quant_state = nan_checker(quant_state)
+                        # quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"no-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
+
+                        model_state = nan_checker(model_state)
+                        # quant_state = nan_checker(quant_state)
+                        # quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"external-zero-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
+
+                        model_state = nan_checker(model_state)
+                        # quant_state = nan_checker(quant_state)
+                        # quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"external-zero-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
+
+                        model_state = nan_checker(model_state)
+                        # quant_state = nan_checker(quant_state)
+                        # quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"internal-zero-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
+
+                        model_state = nan_checker(model_state)
+                        # quant_state = nan_checker(quant_state)
+                        # quant_state[quant_mask] = 0
+
+                        model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"internal-zero-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
+
+                        model_state = nan_checker(model_state)
+                        # quant_state = nan_checker(quant_state)
+                        # quant_state[quant_mask] = 0
+
+                        model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-clean-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=False, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        diff = torch.abs(model_state - quant_state)
+                        mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-clean-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, weight_inject=False, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        diff = torch.abs(model_state - quant_state)
+                        mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-clean-checksum-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=False, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-clean-checksum-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, weight_inject=False, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-clean-gradient-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=False, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        model_state = grad_collector(model_state, f"ssm_state_{t}", replace_tensor=quant_state)
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-clean-gradient-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, weight_inject=False, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        model_state = grad_collector(model_state, f"ssm_state_{t}", replace_tensor=quant_state)
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-dirty-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=False, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        diff = torch.abs(model_state - quant_state)
+                        mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-dirty-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, weight_inject=True, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        diff = torch.abs(model_state - quant_state)
+                        mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-dirty-checksum-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-dirty-checksum-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, weight_inject=True, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        # model_state = grad_collector(model_state, f"ssm_state_{t}")
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+        
+        key = f"backup-dirty-gradient-corr-{error_rate}-output"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, out_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        model_state = grad_collector(model_state, f"ssm_state_{t}", replace_tensor=quant_state)
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+
+        key = f"backup-dirty-gradient-corr-{error_rate}-weight"
+        data[key] = {}
+        data[key]["acc"] = []
+        data[key]["time"] = []
+
+        for test_num in range(num_tests):
+            exec_times = []
+
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+                for images, targets in pbar:
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    if images.size(0) != args.batch_size:
+                        continue
+
+                    # Run stem -> quantized SSM -> head
+                    z = model.stem(images)               # (B,128,32,32)
+                    z = model.pool_width_to_1(z)         # (B,128,32,1)
+                    z = z.squeeze(-1)                    # (B,128,32)
+
+                    Bz, input_dim, L = z.shape
+                    model_state = model.ssm.h0.unsqueeze(0).expand(Bz, -1).contiguous()
+                    quant_state = torch.zeros(Bz, quantized_ssm.A_diag.numel(), device=device)
+
+                    outputs = []
+                    for t in range(L):
+                        start = time.perf_counter()
+
+                        u_t = z[:, :, t]                 # (B, input_dim)
+
+                        model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=error_rate)
+                        quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, weight_inject=True, error_rate=error_rate)
+
+                        model_state = nan_checker(model_state)
+                        quant_state = nan_checker(quant_state)
+                        quant_state[quant_mask] = 0
+
+                        model_state = grad_collector(model_state, f"ssm_state_{t}", replace_tensor=quant_state)
+                        # diff = torch.abs(model_state - quant_state)
+                        # mask = torch.abs(diff - mu_diff) > k * std_diff
+                        # model_state[mask] = quant_state[mask]
+
+                        y_t = model.ssm.get_output(model_state, u_t)
+                        outputs.append(y_t)
+
+                        end = time.perf_counter()
+                        exec_time = end - start
+                        exec_times.append(exec_time)
+
+                    y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
+                    # y_seq = external_corrector(y_seq, "ssm_output")
+
+                    logits = model.head(y_seq)
+                    preds = logits.argmax(dim=1)
+
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+                    pbar.set_postfix(acc=100 * correct / total)
+
+            test_acc = correct / total
+            median_exec_time = stats.median(exec_times) * 1000
+
+            data[key]["acc"].append(test_acc)
+            data[key]["time"].append(median_exec_time)
+    
+    output_path = "stats_out.json"
+    with open(output_path, "w") as f:
+        json.dump(data, f, indent=4)

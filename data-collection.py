@@ -1,87 +1,139 @@
+import json
+import re
+import statistics
 import matplotlib.pyplot as plt
-import numpy as np
+from collections import defaultdict
 
-# Top chart data
-nominal = [0.7967, 0.7967, 0.7967]
-faulty_no_corr = [0.6417, 0.6446, 0.6398]
-faulty_grad_zero_external = [0.7269, 0.7281, 0.7311]
-faulty_grad_zero_internal = [0.7965, 0.7966, 0.7966]
-faulty_backup_clean = [0.7306, 0.7295, 0.7304]
-faulty_backup_faulty = [0.7476, 0.7471, 0.7493]
-faulty_backup_clean_checksum = [0.7889, 0.7883, 0.7901]
-faulty_backup_faulty_chcksum = [0.7921, 0.7912, 0.7915]
+with open("stats_out.json", "r") as f:
+    raw_data = json.load(f)
 
-averages_top = [
-    np.mean(nominal),
-    np.mean(faulty_no_corr),
-    np.mean(faulty_grad_zero_external),
-    np.mean(faulty_grad_zero_internal),
-    np.mean(faulty_backup_clean),
-    np.mean(faulty_backup_faulty),
-    np.mean(faulty_backup_clean_checksum),
-    np.mean(faulty_backup_faulty_chcksum)
-]
+results = {}
 
-labels_top = [
-    "Nominal",
-    "No Correction",
-    "Zeroing (External)",
-    "Zeroing (Internal)",
-    "Backup (Clean)",
-    "Backup (Faulty)",
-    "Backup (Clean) Checksum",
-    "Backup (Faulty) Checksum"
-]
+for k, v in raw_data.items():
+    acc_mean = statistics.mean(v["acc"])
+    time_median = statistics.median(v["time"])
+    if "gradient" in k:
+        continue
+    results[k] = {
+        "acc": acc_mean,
+        "time": time_median
+    }
 
-# Bottom chart data
-faulty_no_corr_vals = [0.2764, 0.2988, 0.3037]
-faulty_ext_vals = [0.5522, 0.5139, 0.5368]
-faulty_int_vals = [0.7963, 0.7971, 0.7967]
-backup_clean_vals = [0.7291, 0.7308, 0.7299]
-backup_faulty_vals = [0.4112, 0.4836, 0.4703]
-backup_clean_checksum_vals = [0.3884, 0.3045, 0.3468]
-backup_faulty_checksum_vals = [0.3748, 0.4461, 0.3417]
+for key, vals in results.items():
+    print(f"{key}: mean(acc)={vals['acc']:.3f}, median(time)={vals['time']:.3f}")
 
-averages_bottom = [
-    np.mean(nominal),
-    np.mean(faulty_no_corr_vals),
-    np.mean(faulty_ext_vals),
-    np.mean(faulty_int_vals),
-    np.mean(backup_clean_vals),
-    np.mean(backup_faulty_vals),
-    np.mean(backup_clean_checksum_vals),
-    np.mean(backup_faulty_checksum_vals)
-]
+error_rates = [1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
 
-labels_bottom = [
-    "Nominal",
-    "No Correction",
-    "Zeroing (External)",
-    "Zeroing (Internal)",
-    "Backup (Clean)",
-    "Backup (Faulty)",
-    "Backup (Clean) Checksum",
-    "Backup (Faulty) Checksum"
-]
+all_acc = {k: v["acc"] for k, v in results.items()}
+nominal_acc = all_acc["nominal"]
 
-# Create subplots
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=False)
+methods = {}
 
-# Top chart
-ax1.bar(labels_top, averages_top)
-ax1.set_ylabel("Average Accuracy")
-ax1.set_title("Average Accuracy with Injection into Output")
-ax1.set_ylim(0.5, 0.85)
-ax1.grid(axis='y', linestyle='--', alpha=0.5)
-ax1.tick_params(axis='x', rotation=90)
+sci_pat = re.compile(r'\b[0-9]+(?:\.[0-9]+)?[eE][+-]?[0-9]+\b')
+dec_pat = re.compile(r'\b[0-9]*\.[0-9]+\b')
 
-# Bottom chart
-ax2.bar(labels_bottom, averages_bottom)
-ax2.set_ylabel("Average Accuracy")
-ax2.set_title("Average Accuracy with Injection into Weight")
-ax2.set_ylim(0.2, 0.85)
-ax2.grid(axis='y', linestyle='--', alpha=0.5)
-ax2.tick_params(axis='x', rotation=90)
+def parse_key(key: str):
+    # Try scientific notation first
+    m = sci_pat.search(key)
+
+    # If not found, fallback to decimal
+    if not m:
+        m = dec_pat.search(key)
+
+    if not m:
+        raise ValueError(f"Could not find an error-rate in key: {key}")
+
+    s, e = m.span()
+
+    # Find hyphens on both sides
+    hyph_left = key.rfind("-", 0, s)
+    hyph_right = key.find("-", e)
+
+    if hyph_left == -1 or hyph_right == -1:
+        raise ValueError(f"Unexpected format in key: {key}")
+
+    method = key[:hyph_left]
+    err_rate = float(key[s:e])
+    suffix = key[hyph_right+1:]
+
+    return method, err_rate, suffix
+
+median_times = defaultdict(dict)
+
+median_times = defaultdict(lambda: defaultdict(list))
+
+for key, vals in results.items():
+    if key == "nominal":
+        continue
+
+    try:
+        method, _, suffix = parse_key(key)
+    except ValueError:
+        continue
+
+    median_time = vals["time"]
+    median_times[method][suffix].append(median_time)
+    
+avg_median_times = {}
+
+for method, suffix_dict in median_times.items():
+    # Average over error rates per suffix
+    suffix_avg = [sum(times)/len(times) for times in suffix_dict.values()]
+    # Average across suffixes
+    avg_median_times[method] = sum(suffix_avg) / len(suffix_avg)
+
+methods = list(avg_median_times.keys())
+times = [avg_median_times[m] for m in methods]
+
+plt.figure(figsize=(10,6))
+bars = plt.bar(methods, times, color='skyblue')
+
+plt.ylabel("Median Execution Time (ms)")
+plt.xlabel("Injection Method")
+plt.title("Comparison of Median Times Across Methods")
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Optional: add numeric labels on top of bars
+for bar, time in zip(bars, times):
+    plt.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+             f"{time:.2f}", ha='center', va='bottom')
 
 plt.tight_layout()
 plt.show()
+
+data = defaultdict(lambda: defaultdict(dict))
+
+for key, acc in all_acc.items():
+    if key == "nominal":
+        continue
+    method, err, suffix = parse_key(key)
+    data[method][suffix][err] = acc
+
+for method, suffix_dict in data.items():
+    fig, axes = plt.subplots(2, 1, figsize=(8, 10), sharex=True)
+    fig.suptitle(f"Performance for correction method: {method}")
+
+    for ax, suffix in zip(axes, ["output", "weight"]):
+        if suffix not in suffix_dict:
+            ax.set_title(f"No data for injection type '{suffix}'")
+            continue
+
+        # accuracy values for this suffix
+        accuracies = [suffix_dict[suffix].get(e, None) for e in error_rates]
+
+        # Plot nominal (horizontal)
+        ax.plot(error_rates, [nominal_acc]*len(error_rates),
+                label="nominal", linestyle="-", color="black")
+
+        # Plot method
+        ax.plot(error_rates, accuracies, marker="o", label=f"{method}-{suffix}")
+
+        ax.set_xscale("log")
+        ax.set_ylabel("Accuracy")
+        ax.legend()
+        ax.set_title(f"Injection type: {suffix}")
+
+    axes[-1].set_xlabel("Error rate (log scale)")
+    plt.tight_layout()
+    plt.show()
