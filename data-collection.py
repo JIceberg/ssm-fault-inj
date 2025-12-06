@@ -12,8 +12,8 @@ results = {}
 for k, v in raw_data.items():
     acc_mean = statistics.mean(v["acc"])
     time_median = statistics.median(v["time"])
-    if "gradient" in k:
-        continue
+    # if "gradient" in k:
+    #     continue
     results[k] = {
         "acc": acc_mean,
         "time": time_median
@@ -89,7 +89,7 @@ plt.figure(figsize=(10,6))
 bars = plt.bar(methods, times, color='skyblue')
 
 plt.ylabel("Median Execution Time (ms)")
-plt.xlabel("Injection Method")
+plt.xlabel("Correction Method")
 plt.title("Comparison of Median Times Across Methods")
 plt.xticks(rotation=45, ha='right')
 plt.grid(axis='y', linestyle='--', alpha=0.7)
