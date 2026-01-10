@@ -619,7 +619,8 @@ if __name__ == '__main__':
         D_q = model.ssm.D.data.clone()
 
     quantized_ssm = None
-    quant_ckpt_path = "quantized_simple_ssm_cifar.pth"
+    final_sparsity = 60
+    quant_ckpt_path = f"quantized_ssm_cifar_{final_sparsity}.pth"
 
     if not os.path.exists(quant_ckpt_path):
         print("Training quantized/pruned SSM via distillation...")
@@ -634,7 +635,7 @@ if __name__ == '__main__':
             D_stage = D_q.clone()
 
             if j != 0:
-                sparsity = 0.2 + j * 0.1
+                sparsity = 0.3 + j * 0.1
                 print(f"Applying sparsity {sparsity:.2f}")
                 A_stage, A_mask = prune_tensor(A_stage, amount=sparsity)
                 B_stage, B_mask = prune_tensor(B_stage, amount=sparsity)
@@ -822,7 +823,7 @@ if __name__ == '__main__':
                 teacher_state, _ = model.ssm.hidden_update(teacher_state, u_t)
                 state, _ = quantized_ssm.hidden_update(state, u_t)
 
-                grad_collector.compute_grad(teacher_state, f"ssm_state_{t}")
+                # grad_collector.compute_grad(teacher_state, f"ssm_state_{t}")
                 diff_vals.append(torch.abs(teacher_state - state))
 
                 y_t = quantized_ssm.get_output(state, u_t)
@@ -832,7 +833,7 @@ if __name__ == '__main__':
                 model_outputs.append(model_y_t)
 
             y_seq = torch.stack(outputs, dim=2)  # (B, output_dim, L)
-            external_corrector.compute_grad(y_seq, layer_name="ssm_output")
+            # external_corrector.compute_grad(y_seq, layer_name="ssm_output")
 
             logits = model.head(y_seq)
             preds = logits.argmax(dim=1)
@@ -857,18 +858,23 @@ if __name__ == '__main__':
     k = 5
 
     data = {}
-    num_tests = 100
+    num_tests = 20
 
     data["nominal"] = {}
     data["nominal"]["acc"] = []
     data["nominal"]["time"] = []
+
+    data["sparsity"] = {}
+    data["sparsity"]["acc"] = []
+    data["sparsity"]["time"] = []
+
     for test_num in range(num_tests):
         exec_times = []
 
         correct = 0
         total = 0
         with torch.no_grad():
-            pbar = tqdm(testloader, desc="Eval Corrected SSM", leave=False)
+            pbar = tqdm(testloader, desc=f"Eval Corrected SSM {test_num}/{num_tests}", leave=False)
             for images, targets in pbar:
                 images = images.to(device)
                 targets = targets.to(device)
@@ -891,17 +897,17 @@ if __name__ == '__main__':
 
                     u_t = z[:, :, t]                 # (B, input_dim)
 
-                    model_state, mask = model.ssm.hidden_update(model_state, u_t)
-                    # quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, out_inject=True, error_rate=1e-3)
+                    model_state, mask = model.ssm.hidden_update(model_state, u_t, weight_inject=True, error_rate=5e-5)
+                    quant_state, quant_mask = quantized_ssm.hidden_update(quant_state, u_t, weight_inject=True, error_rate=5e-5)
 
                     model_state = nan_checker(model_state)
-                    # quant_state = nan_checker(quant_state)
-                    # quant_state[quant_mask] = 0
+                    quant_state = nan_checker(quant_state)
+                    quant_state[quant_mask] = 0
 
                     # model_state = grad_collector(model_state, f"ssm_state_{t}")
-                    # diff = torch.abs(model_state - quant_state)
-                    # mask = torch.abs(diff - mu_diff) > k * std_diff
-                    # model_state[mask] = quant_state[mask]
+                    diff = torch.abs(model_state - quant_state)
+                    mask = torch.abs(diff - mu_diff) > k * std_diff
+                    model_state[mask] = quant_state[mask]
 
                     y_t = model.ssm.get_output(model_state, u_t)
                     outputs.append(y_t)
@@ -923,8 +929,11 @@ if __name__ == '__main__':
         test_acc = correct / total
         median_exec_time = stats.median(exec_times) * 1000
 
-        data["nominal"]["acc"].append(test_acc)
-        data["nominal"]["time"].append(median_exec_time)
+        data["sparsity"]["acc"].append(test_acc)
+        data["sparsity"]["time"].append(median_exec_time)
+
+    avg_sparsity_acc = sum(data["sparsity"]["acc"]) / num_tests
+    print(f"Accuracy: {avg_sparsity_acc:.4f}")
     
     error_rates = [1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
 
