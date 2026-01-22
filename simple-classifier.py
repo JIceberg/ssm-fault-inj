@@ -591,7 +591,7 @@ if __name__ == "__main__":
         for j in range(4):
             if j != 0:
                 # desired sparsity for iteration j
-                sparsity = 0.5 + j * 0.1
+                sparsity = 0.2 + j * 0.1
                 A_q = prune_tensor(A_q, amount=sparsity)
                 B_q = prune_tensor(B_q, amount=sparsity)
                 C_q = prune_tensor(C_q, amount=sparsity)
@@ -735,7 +735,7 @@ if __name__ == "__main__":
 
     k = 5
     data = {}
-    num_tests = 20
+    num_tests = 100
 
     data["nominal"] = {}
     data["nominal"]["acc"] = []
